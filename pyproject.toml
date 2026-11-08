@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-foresight"
+version = "0.1.0"
+description = "A standalone RGB DINO-Foresight baseline for DSEC future detection"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.6", "numpy", "Pillow", "PyYAML", "einops",
+    "lightning>=2.6,<3", "tensorboard", "scipy", "pycocotools",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["foresight*"]
+
+[tool.setuptools.package-data]
+"*" = ["*LICENSE*", "NOTICE*", "*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

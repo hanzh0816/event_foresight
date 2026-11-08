@@ -1,0 +1,37 @@
+# Optional RGB-only DSEC adaptation. No detector is needed for this stage.
+data:
+  root: /data3/hzh/DSEC
+  image_size: [448, 896]
+  sample_history_frames: 40
+  context_frames: 4
+  train_stride: 1
+  val_stride: 1
+  tolerance_us: 1000
+  batch_size: 1 # Per GPU; global batch = batch_size * visible GPUs * accumulation_steps.
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 1
+
+model:
+  dinof_checkpoint: checkpoints/dinof.pt
+  detector_checkpoint: null
+  predictor_checkpoint: null # Optional initialization from a new-project training checkpoint.
+
+optimization:
+  epochs: 40
+  max_steps: 500 # Optional adaptation budget, not a convergence claim.
+  accumulation_steps: 8
+  lr: 0.00001
+  weight_decay: 0.01
+  scheduler: constant
+  warmup_fraction: 0.0
+  clip_grad: 1.0
+  predictor_dropout: false
+  activation_checkpointing: true
+
+runtime:
+  seed: 42
+  precision: bf16-mixed
+  encoder_chunk_size: 1
+  cpu_threads: 4
+  log_every: 10
