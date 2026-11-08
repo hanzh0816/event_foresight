@@ -1,6 +1,7 @@
 """Causal event windows paired with the existing RGB sample inventory."""
 
 import math
+from numbers import Integral
 import numpy as np
 import torch
 from torch.nn import functional as F
@@ -11,17 +12,23 @@ from .event_reader import EventStream, H5HandleCache
 
 
 def encoding_spec(data):
-    """Closed input protocol for the uniform E2 branch."""
+    """Five oldest-to-newest bins within a fixed 50ms or 200ms interval."""
     window = data.get("event_window_us", 50000)
     bins = data.get("event_bins", 5)
     widths = data.get("event_bin_widths_us")
-    if type(window) is not int or window != 50000 or type(bins) is not int or bins != 5:
-        raise ValueError("E2 uses a 50000-us interval and five bins per polarity")
-    if widths is not None and widths != [10000] * 5:
-        raise ValueError("This branch supports uniform event bins only")
+    if type(window) is not int or window not in (50000, 200000) or type(bins) is not int or bins != 5:
+        raise ValueError("Use a 50000/200000-us interval and five bins per polarity")
+    if widths is None:
+        if window != 50000:
+            raise ValueError("200ms windows require explicit bin widths")
+        widths = [10000] * 5
+    if (not isinstance(widths, (tuple, list)) or len(widths) != 5
+            or any(not isinstance(v, Integral) or isinstance(v, bool) or v <= 0 for v in widths)
+            or sum(widths) != window):
+        raise ValueError("Five positive integer bin widths must sum to event_window_us")
     if data.get("event_representation", "histogram") != "histogram":
         raise ValueError("Only histogram event inputs are supported")
-    return dict(event_window_us=window, event_bins=bins, event_bin_widths_us=[10000] * 5,
+    return dict(event_window_us=window, event_bins=bins, event_bin_widths_us=list(map(int, widths)),
                 event_representation="histogram")
 
 
@@ -46,10 +53,14 @@ def event_interval(reader, frame_index, *, window_us=50000, cutoff_us=None):
 
 
 def events_to_voxel(events, start_us, end_us, image_size=(448, 896), *, bins=5,
-                    sensor_size=(HEIGHT, WIDTH), count_scale=5.0):
-    """Polarity-major counts on fixed half-open temporal bins, then log/resize."""
+                    sensor_size=(HEIGHT, WIDTH), count_scale=5.0, event_bin_widths_us=None):
+    """Fixed half-open bins; explicit widths use equivalent 10ms counts."""
     if end_us <= start_us or bins <= 0 or count_scale <= 0:
         raise ValueError("Require end_us > start_us, positive bins and count_scale")
+    widths = None
+    if event_bin_widths_us is not None or end_us-start_us == 200000:
+        widths = encoding_spec(dict(event_window_us=end_us-start_us, event_bins=bins,
+                                    event_bin_widths_us=event_bin_widths_us))["event_bin_widths_us"]
     height, width = map(int, sensor_size)
     out_height, out_width = map(int, image_size)
     if min(height, width, out_height, out_width) <= 0:
@@ -67,11 +78,18 @@ def events_to_voxel(events, start_us, end_us, image_size=(448, 896), *, bins=5,
         raise ValueError("DSEC event polarity must be 0 (negative) or 1 (positive)")
     keep = ((t >= start_us) & (t < end_us) &
             (x >= 0) & (x < width) & (y >= 0) & (y < height))
-    temporal_bin = ((t[keep] - int(start_us)) * bins) // (int(end_us) - int(start_us))
+    if widths is None:
+        temporal_bin = ((t[keep] - int(start_us)) * bins) // (int(end_us) - int(start_us))
+    else:
+        edges = np.concatenate(([0], np.cumsum(widths, dtype=np.int64)))
+        temporal_bin = np.searchsorted(edges, t[keep] - int(start_us), side="right") - 1
     channels = p[keep] * bins + temporal_bin
     flat = (channels * height + y[keep]) * width + x[keep]
     counts = np.bincount(flat, minlength=2 * bins * height * width)
     counts = counts.reshape(2 * bins, height, width).astype(np.float32)
+    if widths is not None:
+        scale = np.float32(10000) / np.asarray(widths, dtype=np.float32)
+        counts *= np.tile(scale, 2)[:, None, None]
     np.log1p(counts, out=counts)
     counts /= math.log1p(count_scale)
     np.clip(counts, 0.0, 1.0, out=counts)
@@ -116,7 +134,8 @@ class EventDataset(RGBDataset):
 
     def voxel(self, reader, index, cutoff):
         start, stop = event_interval(reader, index, window_us=self.encoding["event_window_us"], cutoff_us=cutoff)
-        return events_to_voxel(reader.read_events(start, stop), start, stop, self.image_size), start, stop
+        return events_to_voxel(reader.read_events(start, stop), start, stop, self.image_size,
+                               event_bin_widths_us=self.encoding["event_bin_widths_us"]), start, stop
 
     def __getitem__(self, index):
         name, end = self.windows[index]
@@ -145,5 +164,3 @@ def collate_event(samples):
     keys = ("rgb", "event_voxel") if "rgb" in samples[0] else ("history_events",)
     return {**{key: torch.stack([sample[key] for sample in samples]) for key in keys},
             "meta": [sample["meta"] for sample in samples]}
-
-

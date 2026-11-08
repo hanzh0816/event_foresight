@@ -121,3 +121,28 @@ CUDA_VISIBLE_DEVICES=3 python -m foresight.evaluate --config configs/event.yaml 
 也可传入新训练的 `outputs/event_*/checkpoints/last.ckpt`。评估的事件分箱协议从 Encoder checkpoint 读取，避免配置与权重不匹配。
 
 独立推理使用 `python -m foresight.infer_event --help`：输入含绝对微秒时间戳 `t`、原图坐标 `x/y` 和极性 `p` 的 NPZ，以及四个历史曝光结束时刻；不需要 RGB 或标签。旧实验权重可通过 `scripts/import_event_weights.py --source ... --output ...` 导出为新资产，优化器状态不迁入。
+
+## 时间采样（本分支）
+
+本分支基于 `codex/event-encoder`，只扩展每个历史时刻之前的事件窗口与分箱。五个桶按从早到晚排列，计数统一换算成等效 10ms 计数，再做 log/截断/resize；四个输入截止时刻与未来目标保持不变。
+
+| 配置（`configs/`） | 窗口 | 桶宽，ms（从早到晚） |
+|---|---:|---|
+| `event_50ms_uniform.yaml` | 50ms | 10 / 10 / 10 / 10 / 10 |
+| `event_50ms_recent_fine.yaml` | 50ms | 20 / 12 / 8 / 6 / 4 |
+| `event_50ms_old_fine.yaml` | 50ms | 4 / 6 / 8 / 12 / 20 |
+| `event_200ms_uniform.yaml` | 200ms | 40 / 40 / 40 / 40 / 40 |
+| `event_200ms_recent_fine.yaml` | 200ms | 100 / 50 / 25 / 15 / 10 |
+
+这些配置均从 E2-7500 初始化，重置优化器，训练 1500 次更新；两卡有效 batch 为 8。200ms 窗口之间存在重叠，并非四段互不相交的 200ms 事件。
+
+```bash
+CUDA_VISIBLE_DEVICES=3,5 python -m foresight.train --stage event \
+  --config configs/event_200ms_recent_fine.yaml
+
+CUDA_VISIBLE_DEVICES=3 python -m foresight.evaluate --config configs/event.yaml \
+  --encoder-checkpoint checkpoints/event/200ms_recent_fine.pt \
+  --split val --output outputs/event_200ms_val.json
+```
+
+`200ms_recent_fine.pt` 是迁入的已有权重。`configs/event_test600.json` 保留已使用过的 test 子集，可通过 `--split test --manifest configs/event_test600.json` 复测旧比较。

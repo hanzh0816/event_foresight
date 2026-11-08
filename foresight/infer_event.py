@@ -21,7 +21,9 @@ def make_history(events, frame_ends, encoding, image_size=(448, 896)):
     if len(events["t"]) and np.max(events["t"]) >= frame_ends[-1]:
         raise ValueError("Input contains events at or beyond the historical cutoff")
     window = encoding["event_window_us"]
-    return torch.stack([events_to_voxel(events, end-window, end, image_size) for end in frame_ends])
+    return torch.stack([events_to_voxel(events, end-window, end, image_size,
+                                       event_bin_widths_us=encoding["event_bin_widths_us"])
+                        for end in frame_ends])
 
 
 def main(argv=None):

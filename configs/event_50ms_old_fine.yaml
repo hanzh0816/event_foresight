@@ -1,0 +1,44 @@
+# Weight-only E2 initialization; fresh optimizer. Two GPUs -> global batch 8.
+data:
+  alignment_val_samples: 96
+  batch_size: 2
+  context_frames: 4
+  event_bins: 5
+  event_window_us: 50000
+  image_size:
+  - 448
+  - 896
+  manifest: configs/event_samples.json
+  num_workers: 4
+  root: /data3/hzh/DSEC
+  sample_history_frames: 40
+  tolerance_us: 1000
+  event_bin_widths_us:
+  - 4000
+  - 6000
+  - 8000
+  - 12000
+  - 20000
+model:
+  detector_checkpoint: checkpoints/detector.pt
+  dinof_checkpoint: checkpoints/dinof.pt
+  event_encoder_checkpoint: checkpoints/event/e2_7500.pt
+  predictor_checkpoint: null
+optimization:
+  accumulation_steps: 2
+  betas:
+  - 0.9
+  - 0.999
+  clip_grad: 1.0
+  epochs: 100
+  gradient_checkpointing: false
+  lr: 0.0001
+  max_steps: 1500
+  scheduler: constant
+  weight_decay: 0.01
+runtime:
+  cpu_threads: 4
+  encoder_chunk_size: 1
+  log_every: 10
+  precision: bf16-mixed
+  seed: 42
