@@ -97,4 +97,27 @@ git checkout main
 git checkout -b codex/experiment-name
 ```
 
-权重和 `outputs/` 不提交到 Git。上游来源与许可证见 [SOURCES.json](foresight/vendor/SOURCES.json) 和 [检测模块许可证](foresight/models/APACHE-LICENSE)。
+权重和 `outputs/` 不提交到 Git。上游来源与许可证见 [SOURCES.json](foresight/vendor/SOURCES.json) 和 `foresight/vendor/`。
+
+## Event Encoder（本分支）
+
+E2 将 DINOv2 的输入投影改成 10 通道，微调整个 Encoder，用当前配对 RGB 的 PCA 特征做 SmoothL1 对齐。每个时刻使用曝光结束前 50ms 的事件，正负极性各 5 个等宽 bin；PCA、RGB Teacher、Predictor 和 Detector 均保持固定。推理只需要四段历史事件。
+
+```bash
+python -m pip install -e '.[event,test]'
+CUDA_VISIBLE_DEVICES=3,5 python -m foresight.train --stage event
+```
+
+默认从 RGB 权重初始化，沿用固定 train6000/val600；两卡有效 batch 为 8。已有 E2 权重位于 `checkpoints/event/e2_7500.pt`，作为新训练初始化时加 `--init-from checkpoints/event/e2_7500.pt`。`--resume` 仅用于新项目产生的 Event 训练 checkpoint。
+
+通过固定 Predictor/Detector 评估 Event-only 未来检测：
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m foresight.evaluate --config configs/event.yaml \
+  --encoder-checkpoint checkpoints/event/e2_7500.pt \
+  --split val --output outputs/event_val.json
+```
+
+也可传入新训练的 `outputs/event_*/checkpoints/last.ckpt`。评估的事件分箱协议从 Encoder checkpoint 读取，避免配置与权重不匹配。
+
+独立推理使用 `python -m foresight.infer_event --help`：输入含绝对微秒时间戳 `t`、原图坐标 `x/y` 和极性 `p` 的 NPZ，以及四个历史曝光结束时刻；不需要 RGB 或标签。旧实验权重可通过 `scripts/import_event_weights.py --source ... --output ...` 导出为新资产，优化器状态不迁入。

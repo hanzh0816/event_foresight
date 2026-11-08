@@ -58,19 +58,25 @@ class _RGBTask(LightningModule):
             "feature_space": "dinov2-multilayer-fixed-pca",
         }
 
+    def _make_dataset(self, split):
+        from .data import RGBDataset
+        data = self.config["data"]
+        return RGBDataset(
+            data["root"], split=split, image_size=data["image_size"],
+            sample_history_frames=data.get("sample_history_frames", 40),
+            context_frames=data.get("context_frames", 4),
+            stride=data.get(f"{split}_stride", 1), tolerance_us=data.get("tolerance_us", 1000),
+            sequences=data.get(f"{split}_sequences"), sample_ids=data.get(f"{split}_sample_ids"),
+            future_rgb=self.stage == "predictor")
+
+    def _collate_fn(self):
+        from .data import collate_rgb
+        return collate_rgb
+
     def _loader(self, split):
-        from .data import RGBDataset, collate_rgb
         data = self.config["data"]
         if split not in self.datasets:
-            self.datasets[split] = RGBDataset(
-                data["root"], split=split, image_size=data["image_size"],
-                sample_history_frames=data.get("sample_history_frames", 40),
-                context_frames=data.get("context_frames", 4),
-                stride=data.get(f"{split}_stride", 1),
-                tolerance_us=data.get("tolerance_us", 1000),
-                sequences=data.get(f"{split}_sequences"),
-                sample_ids=data.get(f"{split}_sample_ids"),
-                future_rgb=self.stage == "predictor")
+            self.datasets[split] = self._make_dataset(split)
         dataset = self.datasets[split]
         if not len(dataset):
             raise ValueError(f"No valid DSEC {split} windows")
@@ -80,7 +86,7 @@ class _RGBTask(LightningModule):
         workers = data.get("num_workers", 8)
         return DataLoader(
             dataset, batch_size=data["batch_size"], sampler=sampler, num_workers=workers,
-            collate_fn=collate_rgb, pin_memory=True,
+            collate_fn=self._collate_fn(), pin_memory=True,
             **({"multiprocessing_context": "spawn", "prefetch_factor": data.get("prefetch_factor", 1),
                 "persistent_workers": data.get("persistent_workers", True)} if workers else {}))
 

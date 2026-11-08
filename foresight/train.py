@@ -1,4 +1,4 @@
-"""Train a RGB Predictor or Detector; all visible GPUs are used automatically."""
+"""Train an Event Encoder, RGB Predictor or Detector on all visible GPUs."""
 
 import argparse
 from copy import deepcopy
@@ -81,6 +81,7 @@ def resume_config(config, checkpoint, stage):
     restored["model"]["dinof_checkpoint"] = config["model"]["dinof_checkpoint"]
     restored["model"]["detector_checkpoint"] = None
     restored["model"]["predictor_checkpoint"] = None
+    restored["model"]["event_encoder_checkpoint"] = None
     if stage == "detector":
         architecture = saved.get("detector_architecture")
         if not isinstance(architecture, dict):
@@ -92,8 +93,8 @@ def resume_config(config, checkpoint, stage):
 
 def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=None, epochs=None,
         batch_size=None, num_workers=None, limit_train_batches=1.0, limit_val_batches=1.0):
-    if stage not in ("predictor", "detector"):
-        raise ValueError("stage must be predictor or detector")
+    if stage not in ("predictor", "detector", "event"):
+        raise ValueError("stage must be predictor, detector or event")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required; expose GPUs through CUDA_VISIBLE_DEVICES")
     config = deepcopy(config)
@@ -131,7 +132,11 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
         torch.set_num_threads(runtime.get("cpu_threads", 4))
         torch.set_float32_matmul_precision("high")
         seed_everything(runtime.get("seed", 42), workers=True)
-        task = (PredictorTask if stage == "predictor" else DetectorTask)(config)
+        if stage == "event":
+            from .event_training import EventTask
+            task = EventTask(config)
+        else:
+            task = (PredictorTask if stage == "predictor" else DetectorTask)(config)
         trainer = make_trainer(config, stage, limit_train_batches=limit_train_batches,
                                limit_val_batches=limit_val_batches)
         if trainer.is_global_zero:
@@ -162,9 +167,10 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--stage", choices=("predictor", "detector"), default="detector")
+    parser.add_argument("--stage", choices=("predictor", "detector", "event"), default="detector")
     parser.add_argument("--config", help="Defaults to configs/<stage>.yaml")
     parser.add_argument("--resume", help="Full same-stage checkpoint; restores optimizer and training recipe")
+    parser.add_argument("--init-from", help="Event Encoder weights only; starts a fresh optimizer and step count")
     parser.add_argument("--output-dir")
     parser.add_argument("--max-steps", type=int, help="Optimizer steps, including steps already completed on resume")
     parser.add_argument("--epochs", type=int)
@@ -174,6 +180,10 @@ def main(argv=None):
     parser.add_argument("--limit-val-batches", type=batch_limit, default=1.0)
     args = parser.parse_args(argv)
     config = load_config(args.config or f"configs/{args.stage}.yaml")
+    if args.init_from:
+        if args.stage != "event" or args.resume:
+            parser.error("--init-from requires --stage event and cannot be combined with --resume")
+        config["model"]["event_encoder_checkpoint"] = str(resolve_path(args.init_from))
     return run(config, stage=args.stage, resume=args.resume, output_dir=args.output_dir,
                max_steps=args.max_steps, epochs=args.epochs, batch_size=args.batch_size,
                num_workers=args.num_workers, limit_train_batches=args.limit_train_batches,

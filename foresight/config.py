@@ -1,6 +1,7 @@
 """Small, explicit project configuration; paths never depend on shell cwd."""
 
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import yaml
@@ -37,11 +38,19 @@ def load_config(filename):
         raise ValueError("This baseline uses four RGB frames at 448x896")
     if runtime["precision"] not in ("bf16-mixed", "32-true"):
         raise ValueError("precision must be bf16-mixed or 32-true")
-    for container, keys in ((data, ("root",)),
-                            (model, ("dinof_checkpoint", "detector_checkpoint", "predictor_checkpoint"))):
+    for container, keys in ((data, ("root", "manifest")),
+                            (model, ("dinof_checkpoint", "detector_checkpoint", "predictor_checkpoint", "event_encoder_checkpoint"))):
         for key in keys:
             if container.get(key):
                 container[key] = str(resolve_path(container[key]))
     if not model.get("dinof_checkpoint"):
         raise ValueError("model.dinof_checkpoint is required")
+    if data.get("manifest"):
+        selection = json.loads(Path(data["manifest"]).read_text())
+        for split in ("train", "val", "test"):
+            if split in selection and f"{split}_sample_ids" not in data:
+                ids = selection[split]["sample_ids"]
+                if not ids or any(not isinstance(i, str) for i in ids) or len(ids) != len(set(ids)):
+                    raise ValueError(f"Invalid {split} sample manifest")
+                data[f"{split}_sample_ids"] = ids
     return config
