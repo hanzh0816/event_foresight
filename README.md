@@ -20,6 +20,22 @@ python scripts/link_checkpoints.py --root /path/to/checkpoints
 
 DSEC 数据根目录在 `configs/*.yaml` 的 `data.root` 中设置。配置内的相对路径以项目根目录解析，输出默认保存到 `outputs/`。
 
+## DSEC 数据检查
+
+完整 RGB/Event 检查需要额外安装 HDF5 读取依赖：`python -m pip install -e '.[event]'`。
+
+搬运数据后，先在安装了本项目依赖的 Python 环境中检查完整 train/val/test：
+
+```bash
+python scripts/check_dsec.py --data-root /path/to/DSEC
+# 可选：保存 JSON 报告（路径放在 DSEC 之外）
+python scripts/check_dsec.py --data-root /path/to/DSEC --output outputs/dsec_check.json
+```
+
+默认检查 RGB + Event：逐序列检查文件、所有 RGB 帧是否存在且非空、时间戳、检测标注、曝光时间、HDF5 结构及全部有效窗口的事件覆盖，并抽样解码图片和事件。使用项目默认 40 帧历史、4 帧输入、50ms 预测协议，检查固定的 41/6/12 个序列，不读取子集 manifest。输出 `train/eval/test=PASS/FAIL` 和有效窗口数；训练检查包含 train 和 val，eval 对应 val。通过退出码为 `0`，数据缺失或无效为 `1`。
+
+追加 `--deep` 可解码全部 PNG、分块扫描全部事件并校验时间索引，适合检查传输损坏；耗时取决于数据量。200ms 实验追加 `--event-window-us 200000`；仅跑 RGB 时用 `--rgb-only`。Event 检查要求曝光文件齐全，以保持曝光结束时刻对齐协议。脚本只检查数据，不加载模型权重或使用 GPU。
+
 ## 推理与评估
 
 四图推理不需要标签或未来图像：
