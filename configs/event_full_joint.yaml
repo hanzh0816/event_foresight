@@ -1,0 +1,42 @@
+# Full DSEC current+future training. The sole arm difference is future_weight.
+# Paths are relative to the repository root. No manifest means the full inventory.
+data:
+  root: data/DSEC
+  image_size: [448, 896]
+  sample_history_frames: 40
+  context_frames: 4
+  tolerance_us: 1000
+  event_window_us: 50000
+  event_bins: 5
+  batch_size: 1
+  num_workers: 4
+  prefetch_factor: 1
+  persistent_workers: true
+model:
+  dinof_checkpoint: checkpoints/dinof.pt
+  detector_checkpoint: checkpoints/detector.pt
+  predictor_checkpoint: null
+  event_encoder_checkpoint: null
+optimization:
+  epochs: 10
+  max_steps: -1
+  accumulation_steps: 4
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  scheduler: constant
+  clip_grad: 1.0
+  gradient_checkpointing: true
+  activation_checkpointing: true
+  keep_epoch_checkpoints: true
+  current_scope: all
+  current_weight: 1.0
+  future_weight: 1.0
+  trainable_predictor: false
+runtime:
+  seed: 42
+  precision: bf16-mixed
+  encoder_chunk_size: 1
+  event_encoder_chunk_size: 1
+  cpu_threads: 4
+  log_every: 10

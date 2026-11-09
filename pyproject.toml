@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "event-foresight"
 version = "0.1.0"
-description = "A standalone RGB DINO-Foresight baseline for DSEC future detection"
+description = "RGB/Event latent forecasting and DSEC future detection"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.6", "numpy", "Pillow", "PyYAML", "einops",
