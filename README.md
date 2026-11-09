@@ -166,7 +166,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m foresight.train_future_event \
   --output-dir outputs/full_joint_seed42
 ```
 
-先检查少量数据时，为两组各使用单独输出目录，追加 `--max-steps 2 --limit-train-batches 8 --limit-val-batches 2`。正式训练使用上面的完整命令。
+先检查少量数据时，为两组各使用单独输出目录，追加 `--epochs 1 --limit-train-batches 8 --limit-val-batches 2`，每组执行两次更新。正式训练使用上面的完整命令。
 
 运行会保存解析后的配置、数据清单计数与哈希、梯度审计和训练日志。每个 epoch 保留 checkpoint，`epoch_0000.ckpt` 对应完成第1轮，`last.ckpt` 用于恢复。训练内验证记录当前/未来特征误差；检测 AP 使用下一节的独立评测命令。
 
@@ -174,10 +174,10 @@ CUDA_VISIBLE_DEVICES=0,1 python -m foresight.train_future_event \
 CUDA_VISIBLE_DEVICES=0,1 python -m foresight.train_future_event \
   --config configs/event_full_joint.yaml --data-root /path/to/DSEC \
   --resume outputs/full_joint_seed42/checkpoints/last.ckpt \
-  --output-dir outputs/full_joint_seed42
+  --max-steps -1 --output-dir outputs/full_joint_seed42
 ```
 
-恢复时使用原 GPU 数。完整 checkpoint 恢复优化器、训练目标、种子及进度；epoch 中途恢复可能重读该轮开头的样本。
+恢复时使用原 GPU 数。`--max-steps -1` 按 epoch 预算继续训练，避免继承短测的步数上限；Lightning 2.6.6 在有限步数停止的 epoch 边界继续使用有限步数恢复时可能不执行新更新。完整 checkpoint 恢复优化器、训练目标、种子及进度；epoch 中途恢复可能重读该轮开头的样本。
 
 ### 完整当前/未来评测
 
