@@ -7,9 +7,11 @@ exports and never consults their old repository or training configuration.
 
 import argparse
 from collections import OrderedDict
+from collections.abc import Mapping
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -40,8 +42,46 @@ def verify_tensors(source, exported):
     return len(source)
 
 
+def validate_fp32_state(state, count, label):
+    if not isinstance(state, Mapping) or len(state) != count:
+        raise ValueError(f"Expected all{count} {label} tensors")
+    for key, value in state.items():
+        if (not isinstance(key, str) or not isinstance(value, torch.Tensor)
+                or value.device.type != "cpu" or value.dtype != torch.float32
+                or not torch.isfinite(value).all()):
+            raise ValueError(f"Source tensor {key} is not finite CPU FP32")
+
+
+def validate_dinof_source(dinof):
+    """Validate the official asset independently of any DSEC-trained task head."""
+    if not isinstance(dinof, Mapping):
+        raise ValueError("Official source must be a Lightning checkpoint mapping")
+    hyper = dinof.get("hyper_parameters", {})
+    if not isinstance(hyper, Mapping):
+        raise ValueError("Official source hyper_parameters must be a mapping")
+    args = hyper.get("args", hyper)
+    if not isinstance(args, Mapping):
+        if not hasattr(args, "__dict__"):
+            raise ValueError("Official source args must be a mapping or namespace")
+        args = vars(args)
+    settings = {"sequence_length": 5, "dinov2_variant": "vitb14_reg", "masking": "simple_replace",
+                "feature_extractor": "dino", "seperable_attention": True, "seperable_window_size": 1,
+                "use_first_last": False, "use_fc_bias": True, "output_activation": "none",
+                "crop_feats": False, "sliding_window_inference": False,
+                "hidden_dim": 1152, "heads": 8, "layers": 12, "dropout": 0.1}
+    for key, value in settings.items():
+        if key in args and args[key] != value:
+            raise ValueError(f"Unsupported source Predictor setting: {key}")
+    if "img_size" in args and list(args["img_size"]) != [448, 896]:
+        raise ValueError("Official source resolution mismatch")
+    if "d_layers" in args and list(args["d_layers"]) != [2, 5, 8, 11]:
+        raise ValueError("Official source intermediate layers mismatch")
+    validate_fp32_state(dinof.get("state_dict"), 404, "official")
+
+
 def validate_sources(dinof, detector, dinof_hash):
-    if detector.get("dinof_format") != "dino-foresight-dsec-head-v1":
+    validate_dinof_source(dinof)
+    if not isinstance(detector, Mapping) or detector.get("dinof_format") != "dino-foresight-dsec-head-v1":
         raise ValueError("Expected the existing RGB DSEC detector source checkpoint")
     spec = detector.get("dinof_inputs", {})
     expected = dict(image_size=[448, 896], context_frames=4, sample_history_frames=40,
@@ -55,43 +95,24 @@ def validate_sources(dinof, detector, dinof_hash):
     for key in ("image_size", "history_length", "d_layers", "hidden_dim", "depth", "heads", "dropout"):
         if teacher.get(key) != DINO_ARCHITECTURE[key]:
             raise ValueError(f"Source model configuration mismatch: {key}")
-    hyper = dinof.get("hyper_parameters", {})
-    args = hyper.get("args", hyper)
-    args = args if isinstance(args, dict) else vars(args)
-    settings = {"sequence_length": 5, "dinov2_variant": "vitb14_reg", "masking": "simple_replace",
-                "feature_extractor": "dino", "seperable_attention": True, "seperable_window_size": 1,
-                "use_first_last": False, "use_fc_bias": True, "output_activation": "none",
-                "crop_feats": False, "sliding_window_inference": False}
-    for key, value in settings.items():
-        if key in args and args[key] != value:
-            raise ValueError(f"Unsupported source Predictor setting: {key}")
-    if "img_size" in args and list(args["img_size"]) != [448, 896]:
-        raise ValueError("Official source resolution mismatch")
-    if "d_layers" in args and list(args["d_layers"]) != [2, 5, 8, 11]:
-        raise ValueError("Official source intermediate layers mismatch")
-    states = (dinof.get("state_dict", {}), detector.get("state_dict", {}))
-    if len(states[0]) != 404 or len(states[1]) != 296:
-        raise ValueError("Expected all404 official tensors and all296 detector tensors")
-    if any(not k.startswith("detector.") for k in states[1]):
+    validate_fp32_state(detector.get("state_dict"), 296, "detector")
+    if any(not k.startswith("detector.") for k in detector["state_dict"]):
         raise ValueError("Detector source contains unexpected frozen or training parameters")
-    for state in states:
-        for key, value in state.items():
-            if not isinstance(value, torch.Tensor) or value.dtype != torch.float32 or not torch.isfinite(value).all():
-                raise ValueError(f"Source tensor {key} is not finite FP32")
     return config, spec
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--dinof-source", required=True)
-    parser.add_argument("--detector-source", required=True)
+    parser.add_argument("--detector-source", help="Optional compatible DSEC head; omit to export only the official RGB model")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args(argv)
     torch.set_num_threads(4)
     if torch.cuda.is_initialized():
         raise RuntimeError("Weight conversion must run without CUDA initialization")
-    sources = {name: Path(getattr(args, f"{name}_source")).expanduser().resolve() for name in ("dinof", "detector")}
+    sources = {name: Path(getattr(args, f"{name}_source")).expanduser().resolve()
+               for name in ("dinof", "detector") if getattr(args, f"{name}_source")}
     output = Path(args.output_dir).expanduser().resolve()
     destinations = {name: output / f"{name}.pt" for name in sources}
     if any(path in sources.values() for path in destinations.values()):
@@ -99,57 +120,77 @@ def main(argv=None):
     if not args.verify_only and any((output / name).exists() for name in ("dinof.pt", "detector.pt", "assets.json")):
         raise FileExistsError("Export destination already contains assets; use --verify-only or another directory")
     hashes = {name: file_sha256(path) for name, path in sources.items()}
-    # These two explicitly supplied files are trusted historical Lightning
+    # Explicitly supplied files are trusted historical Lightning
     # assets. Their training metadata is discarded after conversion.
     original = {name: torch.load(path, map_location="cpu", weights_only=False, mmap=True)
                 for name, path in sources.items()}
-    config, spec = validate_sources(original["dinof"], original["detector"], hashes["dinof"])
-    detector_architecture = dict(config["model"], feature_dim=3072, grid_size=[32, 64])
-    state_dicts = {"dinof": OrderedDict(original["dinof"]["state_dict"]),
-                  "detector": OrderedDict((key.removeprefix("detector."), value)
-                                          for key, value in original["detector"]["state_dict"].items())}
+    spec = None
+    if "detector" in original:
+        config, spec = validate_sources(original["dinof"], original["detector"], hashes["dinof"])
+    else:
+        validate_dinof_source(original["dinof"])
+    state_dicts = {"dinof": OrderedDict(original["dinof"]["state_dict"])}
     provenance = {name: {"source_filename": sources[name].name, "source_checkpoint_sha256": hashes[name],
                          "conversion": "CPU tensor-exact export; optimizer/scheduler/trainer state excluded"}
                   for name in sources}
     bundles = {
         "dinof": {"format": DINO_FORMAT, "architecture": deepcopy(DINO_ARCHITECTURE),
                   "state_dict": state_dicts["dinof"], "provenance": provenance["dinof"]},
-        "detector": {"format": DETECTOR_FORMAT, "architecture": detector_architecture,
-                     "state_dict": state_dicts["detector"], "input_spec": deepcopy(spec),
-                     "provenance": provenance["detector"]},
     }
-    if not args.verify_only:
-        output.mkdir(parents=True, exist_ok=True)
-        for name, bundle in bundles.items():
-            temporary = destinations[name].with_suffix(".pt.tmp")
-            with temporary.open("xb") as handle:
-                torch.save(bundle, handle)
-            temporary.replace(destinations[name])
-    report = {"format": "event-foresight-assets-v1", "assets": {}}
-    for name, path in destinations.items():
-        loaded = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-        if loaded["format"] != bundles[name]["format"] or loaded["architecture"] != bundles[name]["architecture"]:
-            raise ValueError("Export metadata mismatch")
-        count = verify_tensors(state_dicts[name], loaded["state_dict"])
-        report["assets"][name] = {"filename": path.name, "sha256": file_sha256(path),
-                                  "source_checkpoint_sha256": hashes[name], "tensor_count": count,
-                                  "tensor_elements": sum(v.numel() for v in loaded["state_dict"].values()),
-                                  "all_tensors_equal": True}
-    # Strict real-model construction also checks all names and tensor shapes.
-    forecaster = DINOForecaster(destinations["dinof"])
-    detector = load_detector(destinations["detector"])
-    assert len(forecaster.state_dict()) == 404 and len(detector.state_dict()) == 296
-    assert not any(v.is_meta for model in (forecaster, detector) for v in model.state_dict().values())
-    if torch.cuda.is_initialized():
-        raise RuntimeError("CPU conversion unexpectedly initialized CUDA")
-    report["verification"] = {"tensor_count": 700, "all_tensors_equal": True,
-                              "strict_real_architecture_load": True, "cuda_initialized": False,
-                              "numerical_forward_validated": False}
-    report["input_spec"] = deepcopy(spec)
-    if not args.verify_only:
-        temporary = output / "assets.json.tmp"
-        temporary.write_text(json.dumps(report, indent=2) + "\n")
-        temporary.replace(output / "assets.json")
+    if "detector" in original:
+        state_dicts["detector"] = OrderedDict((key.removeprefix("detector."), value)
+                                             for key, value in original["detector"]["state_dict"].items())
+        bundles["detector"] = {
+            "format": DETECTOR_FORMAT, "architecture": dict(config["model"], feature_dim=3072, grid_size=[32, 64]),
+            "state_dict": state_dicts["detector"], "input_spec": deepcopy(spec), "provenance": provenance["detector"]}
+    staged = []
+    paths = destinations if args.verify_only else {name: path.with_suffix(".pt.tmp") for name, path in destinations.items()}
+    try:
+        if not args.verify_only:
+            output.mkdir(parents=True, exist_ok=True)
+            for name, bundle in bundles.items():
+                with paths[name].open("xb") as handle:
+                    staged.append(paths[name])
+                    torch.save(bundle, handle)
+        report = {"format": "event-foresight-assets-v1", "assets": {}}
+        for name, path in paths.items():
+            loaded = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+            for key in ("format", "architecture", "provenance", "input_spec"):
+                if loaded.get(key) != bundles[name].get(key):
+                    raise ValueError(f"Export metadata mismatch: {name}.{key}")
+            count = verify_tensors(state_dicts[name], loaded["state_dict"])
+            report["assets"][name] = {"filename": destinations[name].name, "sha256": file_sha256(path),
+                                      "source_checkpoint_sha256": hashes[name], "tensor_count": count,
+                                      "tensor_elements": sum(v.numel() for v in loaded["state_dict"].values()),
+                                      "all_tensors_equal": True}
+        # Validate every name/shape against the real architecture before publishing.
+        models = {"dinof": DINOForecaster(paths["dinof"])}
+        if "detector" in paths:
+            models["detector"] = load_detector(paths["detector"])
+        for name, model in models.items():
+            if (len(model.state_dict()) != report["assets"][name]["tensor_count"]
+                    or any(v.is_meta for v in model.state_dict().values())):
+                raise ValueError(f"Incomplete real architecture load: {name}")
+        if torch.cuda.is_initialized():
+            raise RuntimeError("CPU conversion unexpectedly initialized CUDA")
+        report["verification"] = {"tensor_count": sum(item["tensor_count"] for item in report["assets"].values()),
+                                  "all_tensors_equal": True, "strict_real_architecture_load": True,
+                                  "cuda_initialized": False, "numerical_forward_validated": False}
+        if spec is not None:
+            report["input_spec"] = deepcopy(spec)
+        if not args.verify_only:
+            temporary = output / "assets.json.tmp"
+            with temporary.open("x") as handle:
+                staged.append(temporary)
+                handle.write(json.dumps(report, indent=2) + "\n")
+            # Hard-link publication is atomic and fails if another process has
+            # created the destination; unlike replace(), it never overwrites.
+            for name, path in paths.items():
+                os.link(path, destinations[name])
+            os.link(temporary, output / "assets.json")
+    finally:
+        for path in staged:
+            path.unlink(missing_ok=True)
     print(json.dumps(report, indent=2))
     return report
 

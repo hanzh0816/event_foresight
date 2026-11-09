@@ -1,0 +1,55 @@
+# Train the RGB forecast detector from random weights on the complete DSEC split.
+data:
+  root: data/DSEC
+  image_size: [448, 896]
+  sample_history_frames: 40
+  context_frames: 4
+  train_stride: 1
+  val_stride: 1
+  test_stride: 1
+  tolerance_us: 1000
+  batch_size: 4 # Per GPU.
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 1
+
+model:
+  dinof_checkpoint: checkpoints/dinof.pt
+  detector_checkpoint: null
+  predictor_checkpoint: null
+
+detector:
+  hidden_dim: 256
+  num_classes: 8
+  num_queries: 300
+  num_levels: 4
+  encoder_layers: 6
+  decoder_layers: 6
+  heads: 8
+  points: 4
+  mlp_dim: 1024
+  dropout: 0.1
+
+loss:
+  class_weight: 2.0
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  alpha: 0.25
+  gamma: 2.0
+
+optimization:
+  epochs: 40
+  max_steps: -1
+  accumulation_steps: 1
+  lr: 0.0001
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_fraction: 0.05
+  clip_grad: 1.0
+
+runtime:
+  seed: 42
+  precision: bf16-mixed
+  encoder_chunk_size: 1
+  cpu_threads: 4
+  log_every: 10

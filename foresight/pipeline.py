@@ -1,6 +1,7 @@
 """Inference assembly, independent of Lightning and dataset annotations."""
 
 from contextlib import nullcontext
+from collections.abc import Mapping
 
 import torch
 from torch import nn
@@ -32,6 +33,15 @@ def load_pipeline(config, checkpoint=None):
         saved = read_checkpoint(checkpoint)
         if saved.get("foresight_format") != TRAINING_FORMAT or saved.get("stage") != "detector":
             raise ValueError("--checkpoint must be a new-project Detector training checkpoint")
+        spec = saved.get("input_spec", {})
+        # Current retained-coordinate heads share the detector stage and tensor
+        # shapes, but cannot consume forecast features reconstructed by inverse PCA.
+        if (not isinstance(spec, Mapping)
+                or spec.get("readout_feature_source") not in (None, "rgb_forecast")
+                or spec.get("readout_coordinates") not in (None, "inverse_pca")
+                or spec.get("prediction_ms") not in (None, 50)
+                or spec.get("training_objective") not in (None, "forecast_detection")):
+            raise ValueError("--checkpoint requires a forecast detector; current/retained heads are incompatible")
         architecture = saved.get("detector_architecture")
         if not isinstance(architecture, dict):
             raise ValueError("Trained Detector checkpoint lacks its architecture")

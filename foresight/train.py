@@ -169,6 +169,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--stage", choices=("predictor", "detector", "event"), default="detector")
     parser.add_argument("--config", help="Defaults to configs/<stage>.yaml")
+    parser.add_argument("--data-root", help="Override the DSEC root, including when resuming")
+    parser.add_argument("--dinof-checkpoint", help="Override the exported RGB model asset, including when resuming")
     parser.add_argument("--resume", help="Full same-stage checkpoint; restores optimizer and training recipe")
     parser.add_argument("--init-from", help="Event Encoder weights only; starts a fresh optimizer and step count")
     parser.add_argument("--output-dir")
@@ -180,6 +182,10 @@ def main(argv=None):
     parser.add_argument("--limit-val-batches", type=batch_limit, default=1.0)
     args = parser.parse_args(argv)
     config = load_config(args.config or f"configs/{args.stage}.yaml")
+    if args.data_root:
+        config["data"]["root"] = str(resolve_path(args.data_root))
+    if args.dinof_checkpoint:
+        config["model"]["dinof_checkpoint"] = str(resolve_path(args.dinof_checkpoint))
     if args.init_from:
         if args.stage != "event" or args.resume:
             parser.error("--init-from requires --stage event and cannot be combined with --resume")

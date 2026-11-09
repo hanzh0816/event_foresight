@@ -10,12 +10,11 @@
 git clone --branch codex/event-future-supervision https://github.com/hanzh0816/event_foresight.git
 cd event_foresight
 python -m pip install -e '.[event,test]'
-python scripts/link_checkpoints.py --root /path/to/model-assets
 ```
 
 运行需要支持 BF16 的 CUDA GPU。先安装适合目标机器的 CUDA PyTorch，再安装本项目；已测试环境为 Python 3.12、PyTorch 2.14.1、Lightning 2.6.6。模型源码已随仓库收录，运行不依赖旧项目，也不会自动联网下载权重。
 
-权重目录包含 `dinof.pt`、`detector.pt` 和 `assets.json`；`checkpoints` 通过软链接访问它们。也可以把实际文件直接放在项目的 `checkpoints/` 下。建立链接时使用目标机器的目录：
+从官方权重开始、重新训练检测头，使用下一节。已有本项目资产时，权重目录包含 `dinof.pt`、`detector.pt` 和 `assets.json`；可以把文件放在项目的 `checkpoints/` 下，或建立软链接：
 
 ```bash
 python scripts/link_checkpoints.py --root /path/to/checkpoints
@@ -29,6 +28,73 @@ DSEC 数据根目录在 `configs/*.yaml` 的 `data.root` 中设置。配置内�
 | `codex/event-encoder` | Event Encoder 当前特征对齐 |
 | `codex/event-temporal-sampling` | 50ms/200ms 均匀与非均匀分箱 |
 | `codex/event-future-supervision` | 包含前述功能，以及当前/未来联合训练、全量配置和双头评测 |
+
+## 从官方权重重新训练检测头
+
+这条流程只需要官方 DINO-Foresight 权重和 DSEC 数据，不依赖旧实验文件。
+
+### 下载并转换官方主干
+
+下载 [官方高分辨率 checkpoint](https://huggingface.co/Sta8is/DINO-Foresight/blob/main/dinof_highres.ckpt)，其中包含 RGB Encoder、PCA 和 Predictor：
+
+```bash
+mkdir -p checkpoints
+wget -c -O checkpoints/dinof_highres.ckpt \
+  https://huggingface.co/Sta8is/DINO-Foresight/resolve/main/dinof_highres.ckpt
+python -m scripts.import_weights \
+  --dinof-source checkpoints/dinof_highres.ckpt --output-dir checkpoints
+```
+
+下载约 3.45GB，原文件 SHA256 为 `4f90652bd2992186a4672a278f8d7cfd2710c38d453abfed3887604b8a4536c2`。转换在 CPU 上运行，生成 `checkpoints/dinof.pt` 和来源记录 `assets.json`；已验证其 404 个张量与现用主干逐位一致。转换器拒绝覆盖已有资产，重复校验可追加 `--verify-only`。
+
+### 训练未来检测头
+
+从随机初始化的检测头开始，冻结官方 Encoder、PCA 和 Predictor，以预测的未来特征检测未来 50ms 的目标：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m foresight.train \
+  --stage detector --config configs/detector_from_scratch.yaml \
+  --data-root /path/to/DSEC --output-dir outputs/rgb_detector
+
+python -m scripts.export_detector \
+  --source outputs/rgb_detector/checkpoints/best.ckpt \
+  --output checkpoints/detector.pt
+```
+
+默认使用完整 train/val（46,719 / 7,806 个窗口），训练 40 epochs，按完整验证集 AP 保存 `best.ckpt`。每卡 batch 4，两卡有效 batch 8。导出的 `detector.pt` 用于后续 RGB/Event 未来检测评测。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m foresight.evaluate \
+  --data-root /path/to/DSEC --split val --output outputs/rgb_detector_val.json
+```
+
+### 训练当前场景读出头
+
+双头诊断另用一个检测头，输入真实当前 RGB 的保留 PCA 分量 `latent @ pca_components`，监督为当前帧标签。它检验当前场景表示，也用于比较同一读出头在未来特征上的表现：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m foresight.train_current_head \
+  --config configs/current_head.yaml --data-root /path/to/DSEC \
+  --output-dir outputs/rgb_current_head
+```
+
+此头同样随机初始化、冻结 RGB 主干，使用完整 train/val，默认 10 epochs、每卡 batch 1、累积 4 次，两卡有效 batch 8。训练后直接将 `outputs/rgb_current_head/checkpoints/best.ckpt` 传给诊断命令的 `--readout-checkpoint`。它与未来检测头使用不同特征坐标，分别保存。
+
+两个头都可使用独立输出目录，追加 `--epochs 1 --limit-train-batches 8 --limit-val-batches 2` 检查训练及保存流程。正式训练使用上面的完整命令。
+
+### 接着运行 Event 实验
+
+完成主干转换即可开始下文的全量 Event 成对训练；检测头训练可在其他空闲 GPU 上同时进行。两个头完成后，使用新训练的当前头进行完整诊断：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m foresight.diagnose_readout \
+  --config configs/event_full_joint.yaml --data-root /path/to/DSEC \
+  --encoder-checkpoint outputs/full_joint_seed42/checkpoints/last.ckpt \
+  --readout-checkpoint outputs/rgb_current_head/checkpoints/best.ckpt \
+  --full-split --split val --output outputs/full_joint_seed42_val
+```
+
+去掉 `--encoder-checkpoint` 得到使用同一组新检测头的 RGB 对照；分别评测 current/joint Event 模型。用新头重建 RGB 基线后，再比较 Event 与 RGB 的差距。
 
 ## DSEC 数据检查
 
@@ -126,7 +192,7 @@ DSEC/
 
 训练需要事件流、历史及未来 RGB，以及用于生成一致窗口清单的检测标注。设置 `--data-root /path/to/DSEC` 即可迁移数据路径。
 
-Git 之外准备这些资产：
+采用上面的官方下载与重训流程时，只需生成 `dinof.pt`、`detector.pt` 和新当前头的 `best.ckpt`。若要复测旧实验，Git 之外准备以下旧资产：
 
 ```text
 checkpoints/
@@ -141,7 +207,7 @@ checkpoints/
     200ms_recent_fine.pt            # 旧200ms实验复测
 ```
 
-全量两组不需要 `event/` 中的权重。模型文件为本项目转换后的格式；有原始官方/检测头 checkpoint 时，可使用 `scripts/import_weights.py --help` 转换。
+全量两组不需要 `event/` 中的权重。模型文件为本项目转换后的格式；有原始官方/检测头 checkpoint 时，可使用 `python -m scripts.import_weights --help` 转换。
 
 已准备的搬运包名为 `event_foresight_assets.tar`（约2.35GB），配套 `.sha256`；它们与代码分开传输。在新 checkout 根目录校验并解压，即可得到上述 `checkpoints/`，不需要再运行链接脚本：
 
@@ -193,7 +259,7 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.diagnose_readout \
 
 用相同命令评测 A 组及各 epoch checkpoint，在完整验证集上比较/选择模型，再将 `--split val` 改成 `--split test` 做完整测试。每次使用新的输出目录。去掉 `--encoder-checkpoint` 可得到相同评测协议下的 RGB 对照。
 
-`--full-split` 使用完整划分；`--manifest configs/val600.json` 用于旧子集复测。第二个检测头的 `plan.json` 必须与权重放在同一目录且不作修改；其中记录的旧路径无需在新机器上存在。
+`--full-split` 使用完整划分；`--manifest configs/val600.json` 用于旧子集复测。新训练的当前头可直接传 `best.ckpt`。使用旧 `roundtrip_last.pt` 时，其 `plan.json` 必须与权重放在同一目录且不作修改；其中记录的旧路径无需在新机器上存在。
 
 ## 开发
 

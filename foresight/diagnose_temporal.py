@@ -92,7 +92,8 @@ def run(args):
     device = setup_cuda(config)
     torch.manual_seed(config["runtime"]["seed"])
     model = load_event_pipeline(config, resolve_path(args.encoder_checkpoint))
-    real_head = load_real_head(resolve_path(args.readout_checkpoint), model.detector) if args.readout_checkpoint else None
+    real_head = load_real_head(resolve_path(args.readout_checkpoint), model.detector,
+                               pca=model.forecaster.pca) if args.readout_checkpoint else None
     model = model.to(device).eval().requires_grad_(False)
     if real_head is not None:
         real_head = real_head.to(device)

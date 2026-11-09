@@ -28,6 +28,10 @@ from .models.detector import postprocess
 from .pipeline import inference_context, load_pipeline, setup_cuda
 
 
+CURRENT_RETAINED_SOURCE = "rgb_current_retained"
+CURRENT_RETAINED_COORDINATES = "latent @ pca_components"
+
+
 class PairedEventDataset(EventDataset):
     """Future RGB is returned in a separate teacher-only target field."""
 
@@ -133,19 +137,40 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def load_real_head(path, detector):
+def load_real_head(path, detector, *, pca=None):
     saved = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    if (saved.get("format") != "current-pca-head-probe-v1" or saved.get("branch") != "roundtrip"
-            or saved.get("modality") != "rgb" or saved.get("steps") != 500):
-        raise ValueError("Require the fixed RGB retained-feature head after 500 updates")
-    plan_path = Path(path).parent / "plan.json"
-    plan = json.loads(plan_path.read_text())
-    if saved.get("plan_sha256") != sha256(plan_path):
-        raise ValueError("RGB head plan hash differs from checkpoint")
-    if plan.get("input_coordinates") != "shared x=(f-mean)/std-pca_mean; raw=x, roundtrip=x C.T C":
-        raise ValueError("RGB head uses unexpected feature coordinates")
+    if saved.get("foresight_format") == "event-foresight-training-v1" and saved.get("stage") == "detector":
+        from .checkpoints import component_state
+        spec = saved.get("input_spec", {})
+        if (spec.get("readout_feature_source") != CURRENT_RETAINED_SOURCE
+                or spec.get("readout_coordinates") != CURRENT_RETAINED_COORDINATES
+                or spec.get("prediction_ms") != 0):
+            raise ValueError("Require a current RGB retained-coordinate head checkpoint")
+        architecture = saved.get("detector_architecture")
+        if not isinstance(architecture, dict):
+            raise ValueError("Current head checkpoint lacks its architecture")
+        if getattr(detector, "architecture", architecture) != architecture:
+            raise ValueError("Current and forecast heads must use the same detector architecture")
+        if pca is not None:
+            actual = component_state(saved, "forecaster.pca.")
+            expected = pca.state_dict()
+            if expected.keys() != actual.keys() or any(
+                    not torch.equal(expected[key].detach().cpu(), actual[key]) for key in expected):
+                raise ValueError("Current head uses different frozen PCA coordinates")
+        state = component_state(saved, "detector.")
+    else:
+        if (saved.get("format") != "current-pca-head-probe-v1" or saved.get("branch") != "roundtrip"
+                or saved.get("modality") != "rgb" or saved.get("steps") != 500):
+            raise ValueError("Require a current RGB retained-feature head or the legacy 500-step probe")
+        plan_path = Path(path).parent / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        if saved.get("plan_sha256") != sha256(plan_path):
+            raise ValueError("RGB head plan hash differs from checkpoint")
+        if plan.get("input_coordinates") != "shared x=(f-mean)/std-pca_mean; raw=x, roundtrip=x C.T C":
+            raise ValueError("RGB head uses unexpected feature coordinates")
+        state = saved["state_dict"]
     head = deepcopy(detector)
-    head.load_state_dict(saved["state_dict"], strict=True)
+    head.load_state_dict(state, strict=True)
     return head.eval().requires_grad_(False)
 
 
@@ -222,7 +247,8 @@ def run(args):
     event = bool(args.encoder_checkpoint)
     pipeline = (load_event_pipeline(config, resolve_path(args.encoder_checkpoint)) if event
                 else load_pipeline(config))
-    real_head = load_real_head(resolve_path(args.readout_checkpoint), pipeline.detector) if args.readout_checkpoint else None
+    real_head = load_real_head(resolve_path(args.readout_checkpoint), pipeline.detector,
+                               pca=pipeline.forecaster.pca) if args.readout_checkpoint else None
     pipeline = pipeline.to(device).eval().requires_grad_(False)
     if real_head is not None:
         real_head = real_head.to(device)

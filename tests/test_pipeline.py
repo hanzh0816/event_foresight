@@ -96,6 +96,39 @@ def test_trained_detector_restores_without_original_head_asset(trained_detector,
     assert all(not parameter.requires_grad for parameter in restored.parameters())
 
 
+@pytest.mark.parametrize("spec", [
+    {"readout_feature_source": "rgb_current_retained"},
+    {"readout_coordinates": "latent @ pca_components"},
+    {"prediction_ms": 0},
+    {"training_objective": "current_detection"},
+    {"readout_feature_source": "rgb_current_retained",
+     "readout_coordinates": "latent @ pca_components", "prediction_ms": 0},
+])
+def test_forecast_pipeline_rejects_current_detector_protocol(trained_detector, monkeypatch, spec):
+    case = trained_detector
+    case.payload["input_spec"] = spec
+    torch.save(case.payload, case.checkpoint)
+    construct_detector = Mock(side_effect=AssertionError("Reject the protocol before loading detector tensors"))
+    monkeypatch.setattr(pipeline, "FutureDetector", construct_detector)
+    with pytest.raises(ValueError, match="requires a forecast detector"):
+        pipeline.load_pipeline(case.config, case.checkpoint)
+    construct_detector.assert_not_called()
+    case.load_asset.assert_not_called()
+
+
+@pytest.mark.parametrize("spec", [
+    {"prediction_ms": 50},
+    {"readout_feature_source": "rgb_forecast", "readout_coordinates": "inverse_pca",
+     "prediction_ms": 50, "training_objective": "forecast_detection"},
+])
+def test_forecast_pipeline_accepts_explicit_forecast_protocol(trained_detector, spec):
+    case = trained_detector
+    case.payload["input_spec"] = spec
+    torch.save(case.payload, case.checkpoint)
+    restored = pipeline.load_pipeline(case.config, case.checkpoint)
+    assert_state_equal(restored.state_dict(), case.payload["state_dict"])
+
+
 @pytest.mark.parametrize("corruption", ["missing", "unexpected"])
 def test_trained_detector_requires_a_strict_complete_state(trained_detector, corruption):
     case = trained_detector
