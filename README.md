@@ -2,6 +2,8 @@
 
 基于 DINO-Foresight 的 RGB/Event 潜在预测与未来目标检测。Event 分支支持当前 RGB 特征对齐，以及通过冻结 Predictor 回传未来监督来训练 Event Encoder。
 
+本分支新增 [200ms recent_fine 全样本 Encoder joint 训练](docs/event-200ms-joint.md)。后续研究目标见 [探索计划](docs/future-explorations.md)。
+
 输入为四张按时间排序、间隔约 50ms 的 640×480 图片，预处理至 448×896；预测未来 50ms 的目标，输出原图坐标下的检测框、类别和分数。
 
 ## 安装与权重

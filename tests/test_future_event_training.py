@@ -96,7 +96,11 @@ def test_current_scope_and_checkpoint_objective_guard(tmp_path):
     assert payload["input_spec"]["current_scope"] == "last"
 
 
-def test_dataset_separates_true_future_from_four_causal_inputs(event_fixture, monkeypatch):
+@pytest.mark.parametrize("encoding", [
+    {},
+    dict(event_window_us=200000, event_bin_widths_us=[100000, 50000, 25000, 15000, 10000]),
+])
+def test_dataset_separates_true_future_from_four_causal_inputs(event_fixture, monkeypatch, encoding):
     root, path, times, offset = event_fixture
     reads = []
     original = EventSequenceReader.read_image
@@ -106,7 +110,7 @@ def test_dataset_separates_true_future_from_four_causal_inputs(event_fixture, mo
         return original(self, index)
 
     monkeypatch.setattr(EventSequenceReader, "read_image", read)
-    with FutureEventDataset(root, image_size=(28, 42)) as dataset:
+    with FutureEventDataset(root, image_size=(28, 42), **encoding) as dataset:
         sample = dataset[0]
         assert reads == [36, 37, 38, 39, 40]
         assert sample["history_events"].shape == (4, 10, 28, 42)
@@ -114,6 +118,8 @@ def test_dataset_separates_true_future_from_four_causal_inputs(event_fixture, mo
         assert sample["future_rgb_target"].shape == (3, 28, 42)
         assert max(sample["meta"]["event_end_us"]) == sample["meta"]["input_cutoff_us"]
         assert sample["meta"]["target_timestamp_us"] > sample["meta"]["input_cutoff_us"]
+        assert all(stop - start == encoding.get("event_window_us", 50000)
+                   for start, stop in zip(sample["meta"]["event_start_us"], sample["meta"]["event_end_us"]))
         batch = collate_future_event([sample, sample])
         assert batch["history_events"].shape[0] == batch["future_rgb_target"].shape[0] == 2
 

@@ -35,6 +35,14 @@ def test_full_recipes_match_budgets_use_rgb_and_resolve_outside_repo(monkeypatch
     assert joint["optimization"]["max_steps"] == -1
     assert joint["optimization"]["keep_epoch_checkpoints"]
 
+    # The long-window experiment must retain the same full-data objective,
+    # initialization and optimization budget as its 50ms control.
+    long = load_config("configs/event_full_joint_200ms_recent_fine.yaml")
+    assert long["data"]["event_window_us"] == 200000
+    assert long["data"].pop("event_bin_widths_us") == [100000, 50000, 25000, 15000, 10000]
+    long["data"]["event_window_us"] = 50000
+    assert long == joint
+
 
 def test_null_event_checkpoint_initializes_actual_rgb_backbone(tmp_path):
     cfg = task_config(tmp_path)
