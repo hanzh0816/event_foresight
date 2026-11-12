@@ -111,7 +111,7 @@ def run(args):
         interpretation="Inference perturbation/OOD sensitivity; not proof of learned useful dynamics.",
         encoder_predictor_precision=config["runtime"]["precision"], encoder_predictor_matmul_precision="high",
         encoder_chunk_size=config["runtime"]["encoder_chunk_size"], readout_precision="FP32/highest/TF32-off",
-        model=config["model"], event_encoding=model.encoding, data_root=data["root"], sample_ids=ids,
+        model=config["model"], predictor_checkpoint=model.predictor_source, event_encoding=model.encoding, data_root=data["root"], sample_ids=ids,
         inventory_source="manifest" if manifest else "full_split", manifest=str(manifest) if manifest else None,
         future_rgb_teacher_only=True, no_parameter_updates=True,
         source_sha256={__file__: sha256(__file__),

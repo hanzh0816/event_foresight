@@ -1,5 +1,7 @@
 """Event Encoder asset loading and the frozen RGB forecasting/readout path."""
 
+from copy import deepcopy
+
 import torch
 from torch import nn
 
@@ -16,10 +18,10 @@ def read_event_checkpoint(filename):
     saved = read_checkpoint(filename)
     if saved.get("format") == EVENT_FORMAT:
         state = saved["state_dict"]
-    elif saved.get("foresight_format") == TRAINING_FORMAT and saved.get("stage") == "event":
+    elif saved.get("foresight_format") == TRAINING_FORMAT and saved.get("stage") in ("event", "event_predictor"):
         state = component_state(saved, "event_encoder.")
     else:
-        raise ValueError("Expected an exported Event Encoder or a new-project event training checkpoint")
+        raise ValueError("Expected an exported Event Encoder or an event/event_predictor training checkpoint")
     if saved.get("image_size") != [448, 896] and saved.get("input_spec", {}).get("image_size") != [448, 896]:
         raise ValueError("Event checkpoint must use the 448x896 input protocol")
     encoding = encoding_spec(saved["event_encoding"])
@@ -59,9 +61,55 @@ class EventForecastDetector(nn.Module):
         return postprocess(self(history_events))
 
 
+def load_event_predictor(forecaster, encoder, encoding, filename):
+    """Load Event-conditioned P only after validating its entire frozen input path."""
+    saved = read_checkpoint(filename)
+    if saved.get("foresight_format") != TRAINING_FORMAT or saved.get("stage") != "event_predictor":
+        raise ValueError("Expected an event_predictor training checkpoint")
+    spec = saved.get("input_spec", {})
+    if (spec.get("training_objective") != "event_predictor"
+            or spec.get("input_modality") != "events"
+            or spec.get("trainable_encoder") is not False
+            or spec.get("trainable_predictor") is not True
+            or spec.get("image_size") != list(forecaster.image_size)
+            or spec.get("context_frames") != 4 or spec.get("prediction_ms") != 50
+            or spec.get("feature_space") != "dinov2-multilayer-fixed-pca"
+            or spec.get("event_encoding") != encoding
+            or encoding_spec(saved.get("event_encoding", {})) != encoding):
+        raise ValueError("Event Predictor checkpoint uses a different input/encoding protocol")
+    for label, module, prefix in (("Event Encoder", encoder, "event_encoder."),
+                                  ("RGB encoder", forecaster.encoder, "forecaster.encoder."),
+                                  ("PCA", forecaster.pca, "forecaster.pca.")):
+        expected, actual = module.state_dict(), component_state(saved, prefix)
+        if expected.keys() != actual.keys() or any(
+                not torch.equal(expected[key].detach().cpu(), actual[key].detach().cpu()) for key in expected):
+            raise ValueError(f"Event Predictor checkpoint uses a different frozen {label}")
+    # Check keys/shapes before mutating any Predictor parameter.
+    state = component_state(saved, "forecaster.predictor.")
+    expected = forecaster.predictor.state_dict()
+    if expected.keys() != state.keys() or any(expected[key].shape != state[key].shape for key in expected):
+        raise ValueError("Event Predictor checkpoint structure differs")
+    forecaster.predictor.load_state_dict(state, strict=True)
+    return saved
+
+
 def load_event_pipeline(config, encoder_checkpoint, detector_checkpoint=None):
-    rgb = load_pipeline(config, detector_checkpoint)
+    # The detector checkpoint may contain an older RGB Predictor. Assemble that
+    # backend first, then the fixed Event Encoder, then apply the P override last.
+    base = deepcopy(config)
+    override = base["model"].pop("predictor_checkpoint", None)
+    rgb = load_pipeline(base, detector_checkpoint)
     encoder = EventEncoder(rgb.forecaster)
-    _, encoding = load_event_encoder(encoder, encoder_checkpoint)
-    return EventForecastDetector(rgb, encoder, encoding,
-                                 config["runtime"]["encoder_chunk_size"]).eval().requires_grad_(False)
+    saved, encoding = load_event_encoder(encoder, encoder_checkpoint)
+    predictor_source = override or (encoder_checkpoint if saved.get("stage") == "event_predictor" else None)
+    if predictor_source:
+        predictor_saved = read_checkpoint(predictor_source)
+        if predictor_saved.get("stage") == "event_predictor":
+            load_event_predictor(rgb.forecaster, encoder, encoding, predictor_source)
+        else:
+            from .checkpoints import load_predictor
+            load_predictor(rgb.forecaster.predictor, predictor_source, forecaster=rgb.forecaster)
+    pipeline = EventForecastDetector(rgb, encoder, encoding,
+        config["runtime"].get("event_encoder_chunk_size", config["runtime"]["encoder_chunk_size"]))
+    pipeline.predictor_source = str(predictor_source or detector_checkpoint or config["model"]["dinof_checkpoint"])
+    return pipeline.eval().requires_grad_(False)

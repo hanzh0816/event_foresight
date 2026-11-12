@@ -98,6 +98,7 @@ def evaluate(config, *, split="val", manifest=None, checkpoint=None,
         report = evaluator.compute().to_dict()
         if encoder_checkpoint:
             report["metadata"].update(input_modality="event", event_encoding=model.encoding,
+                                       predictor_checkpoint=model.predictor_source,
                                        input_cutoff="last RGB exposure end; event intervals are half-open",
                                        cutoff_to_target_ms={"min": min(cutoff_horizons),
                                                             "max": max(cutoff_horizons),

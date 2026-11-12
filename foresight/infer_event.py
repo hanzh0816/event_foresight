@@ -31,10 +31,13 @@ def main(argv=None):
     parser.add_argument("--events", required=True, help="NPZ with absolute microsecond t and distorted 640x480 x/y/p")
     parser.add_argument("--frame-ends-us", type=int, nargs=4, required=True, help="Historical exposure endpoints, oldest first")
     parser.add_argument("--encoder-checkpoint", required=True)
+    parser.add_argument("--predictor-checkpoint", help="Optional RGB or matching Event Predictor override")
     parser.add_argument("--config", default="configs/detector.yaml")
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     config = load_config(args.config)
+    if args.predictor_checkpoint:
+        config["model"]["predictor_checkpoint"] = str(resolve_path(args.predictor_checkpoint))
     destination = Path(args.output).expanduser().resolve()
     protected = [Path(args.events).expanduser().resolve(), resolve_path(args.encoder_checkpoint)]
     protected += [Path(v) for v in config["model"].values() if isinstance(v, str)]
@@ -53,7 +56,7 @@ def main(argv=None):
     report = dict(frame_ends_us=args.frame_ends_us, input_cutoff_us=args.frame_ends_us[-1],
                   nominal_frame_interval_ms=50, prediction_reference="next RGB frame",
                   coordinate_format="xyxy in original 640x480 pixels",
-                  event_encoding=model.encoding, detections=detections)
+                  event_encoding=model.encoding, predictor_checkpoint=model.predictor_source, detections=detections)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
     print(f"Saved {len(detections)} detections to {destination}")

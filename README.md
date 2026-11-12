@@ -320,3 +320,7 @@ CUDA_VISIBLE_DEVICES=3 python -m foresight.evaluate --config configs/event.yaml 
 ```
 
 `200ms_recent_fine.pt` 是迁入的已有权重。`configs/event_test600.json` 保留已使用过的 test 子集，可通过 `--split test --manifest configs/event_test600.json` 复测旧比较。
+
+## Event 条件 Predictor 微调
+
+冻结已训练的 `full_joint` Event Encoder，只微调 Predictor；完整 checkpoint 可直接用于 Event 检测评价与推理。全样本配置、训练／恢复命令及配套权重校验见 [docs/event-predictor-finetune.md](docs/event-predictor-finetune.md)。下一步的监督分配、多时域预测和 Event 动态信息目标记录在 [docs/future-explorations.md](docs/future-explorations.md)，本分支暂不实现。
