@@ -1,0 +1,5 @@
+extends: motion.yaml
+model:
+  mode: direct
+loss:
+  motion_weight: 0.0

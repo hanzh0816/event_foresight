@@ -1,0 +1,3 @@
+extends: motion.yaml
+model:
+  motion_input: rgb

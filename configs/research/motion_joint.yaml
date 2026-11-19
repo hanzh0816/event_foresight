@@ -1,0 +1,4 @@
+extends: motion_rollout.yaml
+model:
+  train_transition: true
+  init_checkpoint: outputs/research/motion-rollout/checkpoints/last.ckpt

@@ -1,0 +1,3 @@
+extends: motion.yaml
+model:
+  copy_last_motion: true

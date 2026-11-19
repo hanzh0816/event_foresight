@@ -1,0 +1,7 @@
+extends: base.yaml
+stage: motion
+model:
+  mode: explicit
+  teacher_checkpoint: /path/to/transition/checkpoints/last.ckpt
+loss:
+  motion_weight: 1.0

@@ -1,0 +1,3 @@
+extends: motion.yaml
+model:
+  mode: auxiliary
