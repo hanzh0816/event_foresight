@@ -1,0 +1,3 @@
+extends: transition.yaml
+model:
+  transition_mode: no_motion

@@ -1,0 +1,5 @@
+extends: base.yaml
+stage: transition
+model:
+  mode: transition
+  temporal_mode: ordered

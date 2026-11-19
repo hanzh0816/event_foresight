@@ -204,4 +204,4 @@ checkpoint 保存模型与训练配置、优化器及训练步数。epoch 中途
 
 ## 10. 交付验证
 
-2026-11-19：第一阶段提交树独立导出后运行完整测试，103 项通过，1 项跳过。环境为 Python 3.12 / PyTorch 2.15 CPU；跳过项需要通过 `FORESIGHT_ASSET_DIR` 显式提供真实 RGB 预训练权重。训练、评价、比较 CLI 已检查，覆盖合成 DSEC 数据、真实 Lightning 优化器恢复和 COCO 评价。真实 DSEC 训练、GPU/DDP 与研究指标由实验 Agent 按上述协议执行。
+2026-11-19：第一、第二阶段提交树分别独立导出后运行完整测试，分别为 103、109 项通过，各 1 项跳过。环境为 Python 3.12 / PyTorch 2.15 CPU；跳过项需要通过 `FORESIGHT_ASSET_DIR` 显式提供真实 RGB 预训练权重。训练、评价、比较 CLI 已检查，覆盖合成 DSEC 数据、真实 Lightning 优化器恢复、COCO 评价和教师退化诊断。真实 DSEC 训练、GPU/DDP 与研究指标由实验 Agent 按上述协议执行。

@@ -1,0 +1,3 @@
+extends: transition.yaml
+model:
+  temporal_mode: pooled
