@@ -6,6 +6,10 @@
 
 相关文献：[Event 特征提取、处理与对齐调研汇总](docs/event-representation-survey.md)，包含编码器、时序记忆、RGB/VFM 对齐、预测与生成、应用模块及各方法的 GitHub 入口。
 
+## Event–RGB 动态预测研究
+
+新研究代码与原 RGB 基线入口分开。阅读 [完整实验交接](docs/research/EXPERIMENT_HANDOFF.md) 和 [研究方案](docs/research/event-wm-plan.md)。实验按融合对照、观测转移、未来运动与多步推演三个累积分支组织；各分支支持范围与运行前提见交接文档。
+
 ## 安装与权重
 
 ```bash

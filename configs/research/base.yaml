@@ -1,0 +1,48 @@
+# Paths resolve from repository root. Copy/edit a local config before training.
+stage: fusion
+data:
+  root: /path/to/DSEC
+  image_size: [448, 896]
+  event_image_size: [128, 256]
+  context_frames: 4
+  sample_history_frames: 4
+  bins: 5
+  rollout_steps: 1
+  alignment: prealigned_event_view
+  alignment_evidence: null # REQUIRED: actual preprocessing/calibration provenance.
+  batch_size: 1
+  num_workers: 4
+  train_stride: 1
+  val_stride: 1
+  test_stride: 1
+  tolerance_us: 1000
+model:
+  dinof_checkpoint: checkpoints/dinof.pt
+  detector_checkpoint: checkpoints/detector.pt
+  mode: event_ordered
+  motion_dim: 128
+  hidden_dim: 128
+  temporal_mode: ordered
+  transition_mode: motion
+  teacher_checkpoint: null
+  motion_input: event
+  copy_last_motion: false
+  train_transition: false
+loss:
+  scene_weight: 1.0
+  motion_weight: 0.0
+  kind: smooth_l1
+optimization:
+  lr: 0.0001
+  weight_decay: 0.01
+  epochs: 20
+  max_steps: 2000 # Initial matched budget; select a longer common budget from pilots.
+  accumulation_steps: 8
+  clip_grad: 1.0
+runtime:
+  accelerator: gpu
+  devices: auto
+  precision: bf16-mixed
+  seed: 42
+  cpu_threads: 4
+  log_every: 10

@@ -1,0 +1,4 @@
+extends: base.yaml
+model:
+  mode: event_pooled
+  temporal_mode: pooled
