@@ -10,6 +10,8 @@
 
 新研究代码与原 RGB 基线入口分开。阅读 [完整实验交接](docs/research/EXPERIMENT_HANDOFF.md) 和 [研究方案](docs/research/event-wm-plan.md)。实验按融合对照、观测转移、未来运动与多步推演三个累积分支组织；各分支支持范围与运行前提见交接文档。
 
+已有 checkpoint 的下一轮评价见 [运动—场景转移瓶颈诊断](docs/research/TRANSITION_DIAGNOSTIC.md)：在相同样本、检测头与转移器下比较真实未来事件、预测运动、历史运动延续及 RGB 参考，帮助定位转移质量和运动预测问题，无需重新训练。
+
 ## 安装与权重
 
 ```bash
