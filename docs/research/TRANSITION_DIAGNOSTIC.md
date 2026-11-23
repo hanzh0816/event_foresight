@@ -17,7 +17,6 @@
 ## 2. 代码、资产与执行位置
 
 - 本分支：`codex/event-wm-transition-diagnostic`，基于公开代码 `4a7dc5e`（`codex/event-wm-motion-rollout`）。
-- 服务器实验分支反馈为 `codex/wm-run`、`e618f16`；该版本及其运行结果没有包含在本分支基线中。不要覆盖服务器实验目录，也不要假定其修改已经合并。
 - 优先使用服务器已有的 **M-explicit、Event 输入、冻结 T** checkpoint。第一次诊断使用原实验选定的 checkpoint，不重新按本次诊断结果挑选 checkpoint。
 - 需要已有 DINO-Foresight export、共同 detector export 和 DSEC 数据。直接复用上一轮资产，不需要重新导出 detector，也不依赖服务器的 `configs/research/b200/`。
 - 模型结构和研究配置从 motion checkpoint 恢复；原始教师训练 checkpoint、初始化来源 checkpoint 不需要存在于当前路径。CLI 提供的资产和数据路径用于服务器间迁移。
