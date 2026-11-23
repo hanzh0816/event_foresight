@@ -56,6 +56,13 @@ def parameter_counts(module: nn.Module) -> dict[str, int]:
 class TemporalMixer(nn.Module):
     """Attention over a short explicit time axis independently at each site."""
 
+    # Event encoding folds B * intervals * spatial_sites into the attention
+    # batch. Some CUDA SDPA kernels fail at 65,536 batch entries (grid limit):
+    # https://github.com/pytorch/pytorch/issues/146704
+    # Bound every call in the shared mixer, including HistoryFeatures. This is
+    # an execution limit, not a model parameter or a checkpoint/config change.
+    MAX_BATCH_SITES = 16_384
+
     def __init__(self, width: int, length: int):
         super().__init__()
         self.length = length
@@ -69,6 +76,14 @@ class TemporalMixer(nn.Module):
     def forward(self, tokens: Tensor) -> Tensor:
         if tokens.ndim != 3 or tokens.shape[1] != self.length:
             raise ValueError("temporal mixer requires [batch_sites, configured_length, width]")
+        if tokens.shape[0] <= self.MAX_BATCH_SITES:
+            return self._forward_chunk(tokens)
+        # Sites are independent; retain the entire time axis in every chunk.
+        # Autograd sums parameter gradients across chunks as in the full batch.
+        return torch.cat([self._forward_chunk(chunk)
+                          for chunk in tokens.split(self.MAX_BATCH_SITES, dim=0)], dim=0)
+
+    def _forward_chunk(self, tokens: Tensor) -> Tensor:
         x = tokens + self.position
         q = self.norm(x)
         x = x + self.attention(q, q, q, need_weights=False)[0]
