@@ -116,6 +116,32 @@ def test_inference_reads_only_history_and_has_identical_inventory(research_recor
         assert "future_events_target" not in collate_research([sample])
 
 
+def test_rgb_supervision_never_reads_future_event_payload(research_recording, monkeypatch):
+    root, _, times, _ = research_recording
+    image_calls, event_calls = [], []
+    original_image, original_event = RGBSequenceReader.read_image, EventStream.read_events
+    def image_record(self, index):
+        image_calls.append(index)
+        return original_image(self, index)
+    def event_record(self, start, end):
+        event_calls.append((start, end))
+        return original_event(self, start, end)
+    monkeypatch.setattr(RGBSequenceReader, "read_image", image_record)
+    monkeypatch.setattr(EventStream, "read_events", event_record)
+    with make_dataset(root, rollout_steps=4, future_event_targets=False) as rgb_teacher:
+        sample = rgb_teacher[0]
+        assert image_calls == list(range(8))
+        assert event_calls == list(zip(times[:3] + 5000, times[1:4] + 5000))
+        assert sample["future_rgb_target"].shape == (4, 3, 28, 42)
+        assert "future_events_target" not in sample
+        batch = collate_research([sample, sample])
+        assert batch["future_rgb_target"].shape == (2, 4, 3, 28, 42)
+        assert "future_events_target" not in batch
+        with make_dataset(root, rollout_steps=4) as full_teacher:
+            assert rgb_teacher.sample_ids == full_teacher.sample_ids
+            assert rgb_teacher.excluded_windows == full_teacher.excluded_windows
+
+
 def test_common_horizon_inventory_and_evaluator_ids(research_recording):
     root, path, _, tracks = research_recording
     np.save(path / "object_detections/left/tracks.npy", tracks[tracks["track_id"] != 6])
@@ -146,6 +172,7 @@ def test_explicit_ids_stride_and_inventory_history(research_recording):
 @pytest.mark.parametrize("options", [
     {"alignment": None}, {"alignment": "resize"}, {"alignment_evidence": "  "},
     {"context_frames": 1}, {"sample_history_frames": 3}, {"future_targets": 1},
+    {"future_event_targets": 1},
     {"sequences": ["val_seq"]}, {"split": "unknown"}, {"bins": 0},
     {"rollout_steps": 1, "evaluation_horizons": [2]}, {"evaluation_horizons": []},
 ])
@@ -169,8 +196,9 @@ def test_missing_event_coverage_removes_same_windows_for_teacher_and_inference(r
     root, path, times, _ = research_recording
     with h5py.File(path / "events/left/events.h5", "r+") as handle:
         handle["t_offset"][()] = times[2]
-    with make_dataset(root, future_targets=False) as inference, make_dataset(root) as teacher:
-        assert inference.windows == teacher.windows
+    with make_dataset(root, future_targets=False) as inference, make_dataset(root) as teacher, \
+            make_dataset(root, future_event_targets=False) as rgb_teacher:
+        assert inference.windows == teacher.windows == rgb_teacher.windows
         assert inference.windows[0] == ("train_seq", 5)
         assert inference.excluded_windows["coverage"] == 2
 

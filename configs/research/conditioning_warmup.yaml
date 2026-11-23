@@ -1,0 +1,26 @@
+# First stage: preserve the complete pretrained DinoF predictor, train Event branch.
+extends: base.yaml
+stage: conditioning
+data:
+  sample_history_frames: 40 # Inventory eligibility; actual model input is 4 RGB frames.
+  rollout_steps: 1
+model:
+  mode: event_ordered
+  predictor_checkpoint: null # Optional original-project RGB predictor/detector training checkpoint.
+  injection_layer: 6
+  attention_heads: 4
+  motion_dim: 128
+  hidden_dim: 128
+  train_predictor: false
+  predictor_dropout: false
+  activation_checkpointing: true
+  init_checkpoint: null
+loss:
+  kind: smooth_l1
+  scene_weight: 1.0
+  motion_weight: 0.0
+optimization:
+  lr: 0.0001
+  predictor_lr: 0.00001
+  epochs: 40
+  max_steps: 1000

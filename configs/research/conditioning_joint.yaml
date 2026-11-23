@@ -1,0 +1,7 @@
+# Second stage: restore warmup weights and reset optimizer; use --resume within a stage.
+extends: conditioning_warmup.yaml
+model:
+  train_predictor: true
+  init_checkpoint: outputs/conditioning_warmup/checkpoints/last.ckpt
+optimization:
+  max_steps: 4000

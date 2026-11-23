@@ -1,0 +1,4 @@
+extends: conditioning_joint.yaml
+model:
+  mode: event_pooled
+  init_checkpoint: outputs/conditioning_pooled/checkpoints/last.ckpt

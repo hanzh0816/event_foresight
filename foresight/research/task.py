@@ -54,7 +54,7 @@ def _recipe_signature(config):
     cfg.pop("output_dir", None)
     for key in ("root", "num_workers", "prefetch_factor", "persistent_workers"):
         cfg["data"].pop(key, None)
-    for key in ("dinof_checkpoint", "teacher_checkpoint", "detector_checkpoint", "init_checkpoint"):
+    for key in ("dinof_checkpoint", "teacher_checkpoint", "detector_checkpoint", "init_checkpoint", "predictor_checkpoint"):
         cfg["model"].pop(key, None)
     for key in ("accelerator", "devices", "cpu_threads", "log_every"):
         cfg["runtime"].pop(key, None)
@@ -62,7 +62,7 @@ def _recipe_signature(config):
 
 
 class ResearchTask(LightningModule):
-    """New Event modules; pretrained RGB encoder/PCA/predictor stay frozen.
+    """Frozen RGB encoder/PCA with optional full predictor adaptation.
 
     In forecast stages predict_batch only accesses history inputs. Target RGB
     and Event are read exclusively in compute_losses. Transition is explicitly
@@ -79,6 +79,15 @@ class ResearchTask(LightningModule):
             from ..models.forecaster import DINOForecaster
             forecaster = DINOForecaster(options["dinof_checkpoint"], encoder_chunk_size=options["encoder_chunk_size"])
         self.forecaster = forecaster.requires_grad_(False).eval()
+        self.predictor_initialization = deepcopy(saved.get("predictor_initialization")) if saved else None
+        if self.stage == "conditioning":
+            if saved is None and options.get("predictor_checkpoint"):
+                from ..checkpoints import load_predictor
+                path = options["predictor_checkpoint"]
+                load_predictor(forecaster.predictor, path, forecaster=forecaster)
+                self.predictor_initialization = dict(path=str(Path(path).resolve()), sha256=file_sha256(path))
+            forecaster.predictor.requires_grad_(options["train_predictor"])
+            forecaster.predictor.activation_checkpointing = options["activation_checkpointing"]
         if tuple(data["image_size"]) != tuple(forecaster.image_size):
             raise ValueError("RGB image_size differs from the frozen forecaster")
         if data["context_frames"] != forecaster.history_length:
@@ -89,6 +98,15 @@ class ResearchTask(LightningModule):
                           motion_dim=options["motion_dim"], hidden_dim=options["hidden_dim"], bins=data["bins"])
         if model is not None:
             self.model = model
+        elif self.stage == "conditioning":
+            from .conditioning import ConditioningWorldModel
+            self.model = ConditioningWorldModel(
+                **dimensions, predictor_dim=forecaster.predictor.embed.out_features,
+                history_frames=data["context_frames"], injection_layer=options["injection_layer"],
+                attention_heads=options["attention_heads"], mode=options["mode"])
+            depth = len(forecaster.predictor.maskvit.transformer.layers)
+            if not 1 <= options["injection_layer"] < depth:
+                raise ValueError("injection_layer must leave at least one predictor block after injection")
         elif self.stage == "fusion":
             from .fusion import FusionWorldModel
             self.model = FusionWorldModel(**dimensions, history_frames=data["context_frames"], mode=options["mode"])
@@ -137,6 +155,25 @@ class ResearchTask(LightningModule):
     def _initialize_refinement(self, path):
         """Weight-only continuation with a reset optimizer and explicit provenance."""
         source = read_checkpoint(path)
+        if self.stage == "conditioning":
+            if source["config"]["stage"] != "conditioning" or source["model_spec"] != self.model.model_spec():
+                raise ValueError("Conditioning initialization must preserve architecture and mode")
+            for key in ("image_size", "event_image_size", "context_frames", "bins", "rollout_steps",
+                        "sample_history_frames", "tolerance_us", "alignment", "alignment_evidence"):
+                if source["config"]["data"].get(key) != self.config["data"].get(key):
+                    raise ValueError(f"Conditioning initialization changes the observation protocol: {key}")
+            self.model.load_state_dict({key.removeprefix("model."): value
+                                       for key, value in source["state_dict"].items() if key.startswith("model.")}, strict=True)
+            self.forecaster.load_state_dict({key.removeprefix("forecaster."): value
+                                            for key, value in source["state_dict"].items() if key.startswith("forecaster.")}, strict=True)
+            self.forecaster.provenance = deepcopy(source.get("forecaster_provenance", {}))
+            self.predictor_initialization = deepcopy(source.get("predictor_initialization"))
+            self.initialization_provenance = dict(path=str(Path(path).resolve()), sha256=file_sha256(path),
+                                                 git_commit=source.get("git_commit"), optimizer="reset",
+                                                 source_global_step=source.get("global_step"),
+                                                 source_optimization=deepcopy(source["config"]["optimization"]),
+                                                 source_train_predictor=source["config"]["model"]["train_predictor"])
+            return
         if self.stage != "motion" or source["config"]["stage"] != "motion":
             raise ValueError("init_checkpoint requires a motion-stage source and destination")
         previous, current = deepcopy(source["model_spec"]), deepcopy(self.model.model_spec())
@@ -164,6 +201,9 @@ class ResearchTask(LightningModule):
     def train(self, mode=True):
         super().train(mode)
         self.forecaster.eval()
+        if self.stage == "conditioning":
+            options = self.config["model"]
+            self.forecaster.predictor.train(mode and options["train_predictor"] and options["predictor_dropout"])
         return self
 
     @torch.no_grad()
@@ -182,6 +222,10 @@ class ResearchTask(LightningModule):
 
     def predict_batch(self, batch):
         history = self.encode_history(batch)
+        if self.stage == "conditioning":
+            # Frozen backbone parameters still carry gradients to the injected
+            # condition through the second half. Do not wrap this in no_grad.
+            return self.model(history, batch.get("history_events"), self.forecaster.predictor)
         if self.stage == "fusion":
             with torch.no_grad():
                 base = self.forecaster.predictor(history)
@@ -233,6 +277,17 @@ class ResearchTask(LightningModule):
         self.last_validation_step = self.global_step
 
     def configure_optimizers(self):
+        if self.stage == "conditioning":
+            options = self.config["optimization"]
+            groups = []
+            for name, module, lr in (("conditioner", self.model, options["lr"]),
+                                     ("predictor", self.forecaster.predictor, options["predictor_lr"])):
+                parameters = [p for p in module.parameters() if p.requires_grad]
+                if parameters:
+                    groups.append(dict(params=parameters, lr=lr, name=name))
+            if not groups:
+                raise ValueError("Frozen RGB control has no trainable parameters; use the evaluate command")
+            return torch.optim.AdamW(groups, weight_decay=options["weight_decay"])
         parameters = [p for p in self.parameters() if p.requires_grad]
         if not parameters:
             raise ValueError("This diagnostic has no trainable parameters; use the evaluate command")
@@ -248,7 +303,8 @@ class ResearchTask(LightningModule):
             for key in ("sample_ids", "sequences"):
                 if options.get(f"{role}_{key}") is not None:
                     kwargs[key] = options[f"{role}_{key}"]
-            self.datasets[role] = ResearchDSECDataset(options["root"], split=options[f"{role}_split"], stride=options.get(f"{role}_stride", options["stride"]), future_targets=True, **kwargs)
+            self.datasets[role] = ResearchDSECDataset(options["root"], split=options[f"{role}_split"], stride=options.get(f"{role}_stride", options["stride"]), future_targets=True,
+                                                    future_event_targets=self.stage != "conditioning", **kwargs)
         dataset = self.datasets[role]
         if not len(dataset):
             raise ValueError(f"Empty {role} dataset")
@@ -273,6 +329,7 @@ class ResearchTask(LightningModule):
                           model_spec=self.model.model_spec(), protocol=deepcopy(self.protocol),
                           teacher_provenance=deepcopy(self.teacher_provenance), git_commit=git_revision(),
                           initialization_provenance=deepcopy(self.initialization_provenance),
+                          predictor_initialization=deepcopy(self.predictor_initialization),
                           forecaster_architecture=deepcopy(getattr(self.forecaster, "architecture", {})),
                           forecaster_provenance=deepcopy(getattr(self.forecaster, "provenance", {})),
                           trainable_parameters=sum(p.numel() for p in self.parameters() if p.requires_grad),
@@ -285,6 +342,7 @@ class ResearchTask(LightningModule):
             raise ValueError("Checkpoint model architecture or causal protocol differs")
         self.teacher_provenance = deepcopy(checkpoint.get("teacher_provenance"))
         self.initialization_provenance = deepcopy(checkpoint.get("initialization_provenance"))
+        self.predictor_initialization = deepcopy(checkpoint.get("predictor_initialization"))
 
 
 def load_task(config, *, forecaster=None, checkpoint=None, model=None):

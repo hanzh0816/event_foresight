@@ -9,11 +9,23 @@ from torch import nn
 from test_research_data import research_recording
 from foresight.research import evaluate as ev
 from foresight.research.compare import compare
+from foresight.data.event_reader import EventStream
 
 
 class PCA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('basis', torch.eye(8))
     def inverse(self, x):
-        return x
+        return x @ self.basis
+
+
+class TinyPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.offset = nn.Parameter(torch.zeros(8))
+    def forward(self, z):
+        return z[:, -1] + self.offset
 
 
 class TinyForecast(nn.Module):
@@ -23,10 +35,9 @@ class TinyForecast(nn.Module):
         super().__init__()
         self.encoder = nn.Conv2d(3, 8, 1)
         self.pca = PCA()
+        self.predictor = TinyPredictor()
     def encode_latents(self, x):
         return torch.nn.functional.adaptive_avg_pool2d(self.encoder(x), self.grid_size).flatten(2).transpose(1, 2)
-    def predictor(self, z):
-        return z[:, -1]
 
 
 class TinyTask(nn.Module):
@@ -69,6 +80,8 @@ def test_full_evaluation_and_paired_comparison(research_recording, tmp_path, mon
     second=ev.evaluate(cfg,split='train',output=tmp_path/'second.json',reference='rgb',feature_metrics=True,max_samples=2)
     assert second['trainable_parameters'] == 0
     assert second['loaded_task_trainable_parameters'] > 0
+    assert second['reference_provenance']['kind'] == 'original_dinof_rgb_baseline'
+    assert second['parameter_counts']['predictor']['total'] == 8
     assert second['horizons']['1']['features']['fg_l1'] is not None
     comparison=compare([first,second])
     assert comparison['rows'][1]['horizons']['1']['deltas']['AP_delta_points']==0.
@@ -108,3 +121,94 @@ def test_foreground_intersection_and_frozen_state_digest():
     with torch.no_grad():
         model.bias.add_(1)
     assert before != ev.module_digest(model)
+
+
+def test_conditioning_rgb_targets_never_read_future_events(research_recording, tmp_path, monkeypatch):
+    root, _, times, _ = research_recording
+    cfg = evaluation_config(root, tmp_path)
+    cfg['stage'] = 'conditioning'
+    cfg['model']['train_predictor'] = False
+    task = TinyTask()
+    monkeypatch.setattr(ev, 'load_task', lambda *a, **kw: task)
+    monkeypatch.setattr(ev, 'load_detector', lambda *a, **kw: TinyDetector())
+    calls = []
+    original = EventStream.read_events
+    def read(self, start, end):
+        calls.append((start, end))
+        return original(self, start, end)
+    monkeypatch.setattr(EventStream, 'read_events', read)
+    ev.evaluate(cfg, split='train', output=tmp_path/'features.json', reference='rgb',
+                feature_metrics=True, max_samples=1)
+    assert calls == list(zip(times[:3] + 5000, times[1:4] + 5000))
+    ev.evaluate(cfg, split='train', output=tmp_path/'frozen.json', max_samples=1)
+    cfg['model']['train_predictor'] = True
+    with pytest.raises(ValueError, match='checkpoint is required'):
+        ev.evaluate(cfg, split='train', output=tmp_path/'untrained.json')
+    cfg['model'].update(mode='motion', train_predictor=False)
+    with pytest.raises(ValueError, match='checkpoint is required'):
+        ev.evaluate(cfg, split='train', output=tmp_path/'untrained-motion.json')
+
+
+def test_rgb_reference_records_checkpoint_source(research_recording, tmp_path, monkeypatch):
+    cfg = evaluation_config(research_recording[0], tmp_path)
+    task = TinyTask()
+    monkeypatch.setattr(ev, 'load_task', lambda *a, **kw: task)
+    monkeypatch.setattr(ev, 'load_detector', lambda *a, **kw: TinyDetector())
+    cfg['model']['predictor_checkpoint'] = cfg['model']['dinof_checkpoint']
+    baseline = ev.evaluate(cfg, split='train', output=tmp_path/'predictor.json',
+                           reference='rgb', max_samples=1)
+    assert baseline['reference_provenance']['kind'] == 'configured_rgb_predictor_baseline'
+    adapted = ev.evaluate(cfg, checkpoint=cfg['model']['dinof_checkpoint'], split='train',
+                          output=tmp_path/'adapted.json', reference='rgb', max_samples=1)
+    assert adapted['reference_provenance']['kind'] == 'loaded_predictor_rgb_ablation'
+    cfg['model']['init_checkpoint'] = cfg['model']['dinof_checkpoint']
+    initialized = ev.evaluate(cfg, split='train', output=tmp_path/'initialized.json',
+                              reference='rgb', max_samples=1)
+    assert initialized['reference_provenance']['kind'] == 'initialized_predictor_rgb_ablation'
+
+
+def test_comparison_allows_predictor_tuning_but_rejects_feature_changes(research_recording, tmp_path, monkeypatch):
+    cfg = evaluation_config(research_recording[0], tmp_path)
+    task = TinyTask()
+    monkeypatch.setattr(ev, 'load_task', lambda *a, **kw: task)
+    monkeypatch.setattr(ev, 'load_detector', lambda *a, **kw: TinyDetector())
+    def report(name):
+        return ev.evaluate(cfg, split='train', output=tmp_path/f'{name}.json',
+                           reference='rgb', max_samples=1)
+    baseline = report('base')
+    with torch.no_grad():
+        task.forecaster.predictor.offset.add_(.1)
+    adapted = report('tuned')
+    assert baseline['forecaster_state_sha256'] != adapted['forecaster_state_sha256']
+    assert baseline['predictor_state_sha256'] != adapted['predictor_state_sha256']
+    assert baseline['feature_space_state_sha256'] == adapted['feature_space_state_sha256']
+    assert compare([baseline, adapted])['compatibility_state_key'] == 'feature_space_state_sha256'
+    with torch.no_grad():
+        task.forecaster.encoder.bias.add_(.1)
+    encoder_change = report('encoder')
+    with pytest.raises(ValueError, match='feature_space_state_sha256'):
+        compare([baseline, encoder_change])
+    with torch.no_grad():
+        task.forecaster.pca.basis.mul_(2)
+    pca_change = report('pca')
+    with pytest.raises(ValueError, match='feature_space_state_sha256'):
+        compare([encoder_change, pca_change])
+
+    legacy = deepcopy(baseline)
+    for key in ('feature_space_state_sha256', 'predictor_state_sha256'):
+        legacy.pop(key)
+    assert compare([legacy, deepcopy(legacy)])['compatibility_state_key'] == 'forecaster_state_sha256'
+    legacy_tuned = deepcopy(legacy)
+    legacy_tuned['forecaster_state_sha256'] = adapted['forecaster_state_sha256']
+    with pytest.raises(ValueError, match='forecaster_state_sha256'):
+        compare([legacy, legacy_tuned])
+    with pytest.raises(ValueError, match='mixed legacy'):
+        compare([baseline, legacy])
+    incomplete = deepcopy(baseline)
+    incomplete.pop('predictor_state_sha256')
+    with pytest.raises(ValueError, match='Incomplete'):
+        compare([baseline, incomplete])
+    missing = deepcopy(legacy)
+    missing.pop('forecaster_state_sha256')
+    with pytest.raises(ValueError, match='provenance'):
+        compare([missing, deepcopy(missing)])

@@ -31,7 +31,7 @@ def _read(path, stack=()):
             raise ValueError("extends must name one YAML file")
         result = _read(path.parent / parent, (*stack, path))
     # Asset paths follow the repository contract; extends is YAML-relative.
-    for section, keys in (("data", ("root",)), ("model", ("dinof_checkpoint", "teacher_checkpoint", "detector_checkpoint", "init_checkpoint"))):
+    for section, keys in (("data", ("root",)), ("model", ("dinof_checkpoint", "teacher_checkpoint", "detector_checkpoint", "init_checkpoint", "predictor_checkpoint"))):
         if isinstance(values.get(section), dict):
             for key in keys:
                 value = values[section].get(key)
@@ -47,8 +47,8 @@ def validate_config(config):
     """Return a normalized copy. Assets are opened only by model/data creation."""
     cfg = deepcopy(config)
     stage = cfg.get("stage")
-    if stage not in ("fusion", "transition", "motion"):
-        raise ValueError("stage must be fusion, transition, or motion")
+    if stage not in ("fusion", "transition", "motion", "conditioning"):
+        raise ValueError("stage must be fusion, transition, motion, or conditioning")
     defaults = {
         "data": dict(image_size=[448, 896], event_image_size=[128, 256], context_frames=4,
                      bins=5, rollout_steps=1, batch_size=1, num_workers=4, tolerance_us=1000,
@@ -67,7 +67,12 @@ def validate_config(config):
             raise ValueError(f"{section} must be a mapping")
         cfg[section] = _merge(base, cfg.get(section, {}))
     data, model, loss, opt, runtime = (cfg[k] for k in defaults)
-    model.setdefault("mode", "event_ordered" if stage == "fusion" else "explicit")
+    model.setdefault("mode", "event_ordered" if stage in ("fusion", "conditioning") else "explicit")
+    if stage == "conditioning":
+        for key, value in dict(injection_layer=6, attention_heads=4, train_predictor=False,
+                               activation_checkpointing=True, predictor_dropout=False).items():
+            model.setdefault(key, value)
+        opt.setdefault("predictor_lr", 1e-5)
     for container, keys in ((data, ("context_frames", "bins", "rollout_steps", "batch_size", "stride")),
                             (model, ("motion_dim", "hidden_dim", "encoder_chunk_size")),
                             (opt, ("epochs", "accumulation_steps")), (runtime, ("cpu_threads", "log_every"))):
@@ -103,6 +108,28 @@ def validate_config(config):
             raise ValueError("Fusion screening uses exactly one rollout step")
         if loss["motion_weight"]:
             raise ValueError("Fusion has no motion supervision")
+    if stage == "conditioning":
+        if model["mode"] not in ("rgb", "event_ordered", "event_pooled"):
+            raise ValueError("Unknown conditioning mode")
+        if data["rollout_steps"] != 1:
+            raise ValueError("Conditioning uses exactly one rollout step")
+        if loss["motion_weight"]:
+            raise ValueError("Conditioning learns from scene targets, with no motion-target loss")
+        if model.get("teacher_checkpoint") or model["train_transition"] or model["copy_last_motion"]:
+            raise ValueError("Conditioning does not use a transition teacher or motion rollout")
+        for key in ("injection_layer", "attention_heads"):
+            if type(model[key]) is not int or model[key] <= 0:
+                raise ValueError(f"model.{key} must be a positive integer")
+        if model["hidden_dim"] % model["attention_heads"]:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+        for key in ("train_predictor", "activation_checkpointing", "predictor_dropout"):
+            if type(model[key]) is not bool:
+                raise ValueError(f"model.{key} must be a boolean")
+        value = opt["predictor_lr"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError("predictor_lr must be finite and positive")
+        if model.get("init_checkpoint") and model.get("predictor_checkpoint"):
+            raise ValueError("Use init_checkpoint or predictor_checkpoint, not both")
     if stage == "transition":
         if model["temporal_mode"] not in ("ordered", "pooled") or model["transition_mode"] not in ("motion", "no_motion"):
             raise ValueError("Invalid transition encoder/condition mode")
@@ -121,8 +148,10 @@ def validate_config(config):
             raise ValueError("train_transition applies only to explicit motion rollout")
         if model["copy_last_motion"] and (model["mode"] != "explicit" or model["motion_input"] != "event"):
             raise ValueError("copy_last_motion is an explicit Event diagnostic")
-    elif model.get("init_checkpoint"):
-        raise ValueError("Weight-only init_checkpoint is supported for motion refinement only")
+    elif stage != "conditioning" and model.get("init_checkpoint"):
+        raise ValueError("Weight-only init_checkpoint is supported for motion or conditioning refinement only")
+    if stage != "conditioning" and model.get("predictor_checkpoint"):
+        raise ValueError("Research predictor_checkpoint is supported for conditioning only")
     horizons = data.get("evaluation_horizons")
     if horizons is not None and (not isinstance(horizons, list) or not horizons or any(type(v) is not int or v < 1 or v > data["rollout_steps"] for v in horizons) or len(set(horizons)) != len(horizons)):
         raise ValueError("evaluation_horizons must be unique steps within rollout_steps")

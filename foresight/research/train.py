@@ -49,7 +49,8 @@ def run(config, *, output_dir, resume=None, limit_train_batches=1.0, limit_val_b
     torch.set_float32_matmul_precision("high")
     seed_everything(runtime["seed"], workers=True)
     task = load_task(config, forecaster=forecaster, checkpoint=resume)
-    if config["model"].get("mode") == "rgb" or config["model"].get("copy_last_motion"):
+    trainable_rgb = task.stage == "conditioning" and config["model"]["train_predictor"]
+    if (config["model"].get("mode") == "rgb" and not trainable_rgb) or config["model"].get("copy_last_motion"):
         raise ValueError("RGB baseline and copy-last-motion are evaluation-only controls")
     if datasets is not None:
         task.datasets = dict(datasets)
@@ -62,6 +63,11 @@ def run(config, *, output_dir, resume=None, limit_train_batches=1.0, limit_val_b
             format=CHECKPOINT_FORMAT, stage=task.stage, git_commit=git_revision(), resume=str(resume) if resume else None,
             protocol=task.protocol, model_spec=task.model.model_spec(), teacher_provenance=task.teacher_provenance,
             initialization_provenance=task.initialization_provenance,
+            predictor_initialization=task.predictor_initialization,
+            parameter_groups={name: dict(total=sum(p.numel() for p in module.parameters()),
+                                        trainable=sum(p.numel() for p in module.parameters() if p.requires_grad))
+                              for name, module in (("conditioner", task.model), ("predictor", task.forecaster.predictor),
+                                                   ("encoder", task.forecaster.encoder))},
             trainable_parameters=sum(p.numel() for p in task.parameters() if p.requires_grad),
             frozen_parameters=sum(p.numel() for p in task.parameters() if not p.requires_grad),
             seed=runtime["seed"], precision=runtime["precision"], accelerator=runtime["accelerator"], devices=runtime["devices"],

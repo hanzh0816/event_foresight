@@ -27,12 +27,30 @@ def file_sha256(path):
 
 
 def module_digest(module):
-    """Fingerprint the loaded frozen state, including checkpoint overrides."""
+    """Fingerprint the loaded state, including checkpoint overrides."""
     digest = hashlib.sha256()
     for name, value in sorted(module.state_dict().items()):
         digest.update(str((name, tuple(value.shape), str(value.dtype))).encode())
         digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def feature_space_digest(forecaster):
+    """Fingerprint the encoder and fixed PCA, independently of predictor tuning."""
+    return module_digest(torch.nn.ModuleDict({'encoder': forecaster.encoder, 'pca': forecaster.pca}))
+
+
+def parameter_counts(task):
+    """Report stored and trainable parameters without conflating frozen assets."""
+    def counts(module):
+        return dict(total=sum(p.numel() for p in module.parameters()),
+                    trainable=sum(p.numel() for p in module.parameters() if p.requires_grad))
+    components = {name: counts(getattr(task.forecaster, name))
+                  for name in ('encoder', 'pca', 'predictor')}
+    if hasattr(task, 'model'):
+        components['research_model'] = counts(task.model)
+    components['loaded_task'] = counts(task)
+    return components
 
 
 def sample_digest(ids):
@@ -74,6 +92,7 @@ def dataset_kwargs(config, split, *, future_targets):
                'sample_history_frames', 'tolerance_us', 'alignment', 'alignment_evidence', 'evaluation_horizons')
     kwargs = {key: data[key] for key in allowed if key in data}
     kwargs.update(root=data['root'], split=split, future_targets=future_targets,
+                  future_event_targets=config['stage'] != 'conditioning',
                   stride=data.get(f'{split}_stride', data.get('stride', 1)))
     for key in ('sequences', 'sample_ids'):
         if data.get(f'{split}_{key}') is not None:
@@ -90,7 +109,11 @@ def evaluate(config, *, checkpoint=None, split='val', output, reference=None,
         raise ValueError('Evaluation horizons must be unique steps within rollout_steps')
     if reference not in (None, 'rgb', 'persistence', 'future_rgb'):
         raise ValueError('Unknown reference')
-    if checkpoint is None and reference is None and not ((config['stage'] == 'fusion' and config['model']['mode'] == 'rgb') or config['model'].get('copy_last_motion')):
+    frozen_rgb = (config['stage'] in ('fusion', 'conditioning')
+                  and config['model']['mode'] == 'rgb'
+                  and not config['model'].get('train_predictor', False))
+    copy_motion = config['stage'] == 'motion' and config['model'].get('copy_last_motion')
+    if checkpoint is None and reference is None and not (frozen_rgb or copy_motion):
         raise ValueError('A trained research checkpoint is required for model evaluation')
     diagnostic = reference == 'future_rgb' or (reference is None and config['stage'] == 'transition')
     require_targets = feature_metrics or diagnostic
@@ -194,9 +217,29 @@ def evaluate(config, *, checkpoint=None, split='val', output, reference=None,
             detector_sha256=file_sha256(config['model']['detector_checkpoint']),
             dinof_sha256=file_sha256(config['model']['dinof_checkpoint']),
             forecaster_state_sha256=module_digest(task.forecaster),
+            feature_space_state_sha256=feature_space_digest(task.forecaster),
+            predictor_state_sha256=module_digest(task.forecaster.predictor),
+            parameter_counts=parameter_counts(task),
+            initialization_provenance=deepcopy(getattr(task, 'initialization_provenance', None)),
+            predictor_initialization=deepcopy(getattr(task, 'predictor_initialization', None)),
             trainable_parameters=0 if reference else sum(p.numel() for p in task.parameters() if p.requires_grad),
             loaded_task_trainable_parameters=sum(p.numel() for p in task.parameters() if p.requires_grad),
             elapsed_seconds=time.monotonic()-started, samples=samples, horizons={})
+        if reference == 'rgb':
+            predictor_checkpoint = config['model'].get('predictor_checkpoint')
+            init_checkpoint = config['model'].get('init_checkpoint')
+            if checkpoint or init_checkpoint:
+                kind = 'loaded_predictor_rgb_ablation' if checkpoint else 'initialized_predictor_rgb_ablation'
+                description = ('RGB-only forward through the predictor loaded from the research checkpoint; '
+                               'predictor adaptation is retained and Event conditioning is bypassed.')
+            elif predictor_checkpoint:
+                kind = 'configured_rgb_predictor_baseline'
+                description = 'RGB-only forward through the configured RGB predictor checkpoint.'
+            else:
+                kind = 'original_dinof_rgb_baseline'
+                description = 'RGB-only forward through the original DINO-Foresight checkpoint predictor.'
+            report['reference_provenance'] = dict(kind=kind, description=description,
+                weights_path=str(checkpoint or init_checkpoint or predictor_checkpoint or config['model']['dinof_checkpoint']))
         if transition_diagnostics is not None:
             report['transition_diagnostics'] = transition_diagnostics.compute()
         for h in horizons:

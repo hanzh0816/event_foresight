@@ -1,0 +1,7 @@
+# RGB-only continuation control with 1000 + 4000 optimizer steps, same data protocol.
+extends: conditioning_warmup.yaml
+model:
+  mode: rgb
+  train_predictor: true
+optimization:
+  max_steps: 5000

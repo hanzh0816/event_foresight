@@ -151,6 +151,58 @@ class DINOFeaturePredictor(nn.Module):
             prediction, = self.maskvit(tokens)
         return prediction.reshape(batch, self.history_length + 1, -1, self.pca_dim)[:, -1]
 
+    def forward_conditioned(self, history, conditioner, after_layer=6):
+        """Run all pretrained blocks, adding a condition to the future slot.
+
+        ``after_layer`` is a one-based count of complete separable blocks.
+        ``conditioner`` receives [B, spatial_tokens, hidden_dim] and returns
+        an additive update of the same shape. It is owned by the caller, so
+        this interface adds no parameters or keys to the pretrained model.
+        Passing None takes the unchanged RGB-only forward path.
+
+        Conditioning happens outside checkpointed blocks exactly once. Frozen
+        block parameters still transmit gradients to the condition and to
+        history tensors produced by an earlier rollout step.
+        """
+        if conditioner is None:
+            return self(history)
+        depth = len(self.maskvit.transformer.layers)
+        if type(after_layer) is not int or not 1 <= after_layer < depth:
+            raise ValueError("after_layer must select a complete block before the final block")
+        if not callable(conditioner):
+            raise TypeError("conditioner must be callable or None")
+        expected = (self.history_length, self.grid_size[0] * self.grid_size[1], self.pca_dim)
+        if history.ndim != 4 or tuple(history.shape[1:]) != expected or not history.is_floating_point():
+            raise ValueError(f"Expected floating PCA history [B,{expected}], got {tuple(history.shape)}")
+        batch = history.shape[0]
+        observed = history.reshape(batch, self.history_length, *self.grid_size, self.pca_dim)
+        embedded = self.embed(observed)
+        # Match forward's FP32 mask-token promotion under autocast.
+        future = self.replace_vector.expand(batch, 1, *self.grid_size, -1)
+        tokens = torch.cat((embedded, future), dim=1)
+        x = self.maskvit.pos_embd(self.maskvit.fc_in(tokens))
+        shape = tuple(x.shape)
+        x = self.maskvit.first_layer(x.flatten(1, 3))
+        for index, layer in enumerate(self.maskvit.transformer.layers, start=1):
+            if self.activation_checkpointing and torch.is_grad_enabled():
+                def block(value, current_layer=layer):
+                    return self._block_forward(value, current_layer, shape)
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = self._block_forward(x, layer, shape)
+            if index == after_layer:
+                maps = x.reshape(batch, self.history_length + 1, -1, shape[-1])
+                update = conditioner(maps[:, -1])
+                if not isinstance(update, torch.Tensor) or update.shape != maps[:, -1].shape:
+                    raise ValueError("conditioner must return the future hidden map's shape")
+                if not update.is_floating_point() or update.device != x.device:
+                    raise ValueError("conditioner update must be floating point on the predictor device")
+                # No in-place update: prefix activations can be saved for
+                # autograd/checkpoint recomputation or used by the conditioner.
+                x = torch.cat((maps[:, :-1], (maps[:, -1] + update).unsqueeze(1)), dim=1).flatten(1, 2)
+        prediction = self.maskvit.fc_out(self.maskvit.last_layer(x))
+        return prediction.reshape(batch, self.history_length + 1, -1, self.pca_dim)[:, -1]
+
 
 class DINOForecaster(nn.Module):
     """Four RGB frames -> future1152 PCA tokens or future3072 dense features.

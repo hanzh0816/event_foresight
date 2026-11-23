@@ -70,6 +70,9 @@ class ResearchDSECDataset(Dataset):
     ``future_targets=False`` reads future annotations and timestamp metadata,
     but never future RGB pixels or future Event payloads. Coverage eligibility
     remains identical to the teacher-target dataset so comparisons are paired.
+    With ``future_targets=True, future_event_targets=False``, only future RGB
+    supervision is loaded; future Event payloads are never read. This likewise
+    leaves the common inventory and Event coverage checks unchanged.
     """
 
     def __init__(self, root, split="train", image_size=(448, 896),
@@ -77,7 +80,7 @@ class ResearchDSECDataset(Dataset):
                  rollout_steps=1, alignment=None, alignment_evidence=None,
                  future_targets=True, stride=1, sample_ids=None,
                  sample_history_frames=None, sequences=None, tolerance_us=1000,
-                 evaluation_horizons=None):
+                 evaluation_horizons=None, future_event_targets=True):
         if alignment != "prealigned_event_view":
             raise ValueError("alignment must explicitly be 'prealigned_event_view'; raw RGB/Event views are not interchangeable")
         if not isinstance(alignment_evidence, str) or not alignment_evidence.strip():
@@ -93,6 +96,8 @@ class ResearchDSECDataset(Dataset):
             raise ValueError(f"Unknown DSEC split: {split!r}")
         if type(future_targets) is not bool:
             raise ValueError("future_targets must be a boolean")
+        if type(future_event_targets) is not bool:
+            raise ValueError("future_event_targets must be a boolean")
         self.image_size, self.event_image_size = _size(image_size), _size(event_image_size)
         if any(dimension % 14 for dimension in self.image_size):
             raise ValueError("image_size must be divisible by patch_size 14")
@@ -104,6 +109,7 @@ class ResearchDSECDataset(Dataset):
         self.history_ms = (self.history_frames - 1) * 50
         self.prediction_frames, self.prediction_ms = self.rollout_steps, self.rollout_steps * 50
         self.future_targets, self.stride, self.tolerance_us = future_targets, int(stride), int(tolerance_us)
+        self.future_event_targets = future_event_targets
         if evaluation_horizons is None:
             evaluation_horizons = list(range(1, rollout_steps + 1))
         if isinstance(evaluation_horizons, (str, bytes)):
@@ -275,7 +281,8 @@ class ResearchDSECDataset(Dataset):
         }
         if self.future_targets:
             sample["future_rgb_target"] = torch.stack([self._rgb(reader, i) for i in future_indices])
-            sample["future_events_target"] = torch.stack([self._event_interval(name, a, b) for a, b in future_intervals])
+            if self.future_event_targets:
+                sample["future_events_target"] = torch.stack([self._event_interval(name, a, b) for a, b in future_intervals])
         return sample
 
     def close(self):

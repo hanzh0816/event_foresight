@@ -8,7 +8,11 @@
 
 ## Event–RGB 动态预测研究
 
-新研究代码与原 RGB 基线入口分开。阅读 [完整实验交接](docs/research/EXPERIMENT_HANDOFF.md) 和 [研究方案](docs/research/event-wm-plan.md)。实验按融合对照、观测转移、未来运动与多步推演三个累积分支组织；各分支支持范围与运行前提见交接文档。
+当前方案为 **Event motion-conditioned DINO-Foresight**：保留完整的 12 层 RGB Predictor，在第 6 层后由未来 token 读取历史事件的时空 tokens，注入条件残差，再预测未来 50ms 的场景特征。训练保留冻结的 DINOv2 与标准化 PCA，以真实未来 RGB 特征监督；先训练事件条件分支，再以较低学习率联合微调 Predictor。
+
+从 [新版方法与训练交接](docs/research/DINOF_MOTION_CONDITIONING.md) 开始，使用 `configs/research/conditioning_*.yaml` 和 `python -m foresight.research.train/evaluate`。事件有序、事件时间汇聚、RGB 微调与冻结 RGB 共同使用因果截止、对齐视角和配对样本协议。代码从 `codex/event-wm-fusion` 的 `4132d60` 开始，当前分支为 `codex/event-dinof-motion-conditioning`。
+
+[旧实验交接](docs/research/EXPERIMENT_HANDOFF.md) 与 [旧研究方案](docs/research/event-wm-plan.md) 保留此前融合、转移教师和运动 rollout 的历史设计；旧阶段不是运行当前方案的前置条件。新版尚无真实 DSEC 训练结果。
 
 ## 安装与权重
 

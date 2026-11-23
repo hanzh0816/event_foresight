@@ -1,0 +1,4 @@
+# Remove bin order within each interval; keep interval order, parameters, and token count.
+extends: conditioning_warmup.yaml
+model:
+  mode: event_pooled

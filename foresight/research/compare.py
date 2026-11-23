@@ -11,7 +11,26 @@ def compare(reports, *, diagnostic=False):
     expected_kind = 'observed_transition_diagnostic' if diagnostic else 'history_only_forecast'
     if base['evaluation_kind'] != expected_kind:
         raise ValueError('Privileged diagnostics cannot be ranked as forecasting results')
-    keys = ('split', 'sample_digest', 'sample_ids', 'samples', 'detector_sha256', 'forecaster_state_sha256', 'evaluation_kind')
+    keys = ('split', 'sample_digest', 'sample_ids', 'samples', 'detector_sha256', 'evaluation_kind')
+    # A tuned predictor is the scientific variable, while encoder/PCA define
+    # the common feature coordinate system. Legacy reports only fingerprinted
+    # the entire forecaster, and cannot establish compatibility with new ones.
+    component_keys = ('feature_space_state_sha256', 'predictor_state_sha256')
+    modern = []
+    for item in reports:
+        present = [key in item for key in component_keys]
+        if any(present) and not all(present):
+            raise ValueError('Incomplete component state provenance')
+        modern.append(all(present))
+    if any(modern) and not all(modern):
+        raise ValueError('Cannot compare mixed legacy and component state provenance')
+    state_key = 'feature_space_state_sha256' if all(modern) else 'forecaster_state_sha256'
+    for item in reports:
+        required = (*component_keys, 'forecaster_state_sha256') if all(modern) else ('forecaster_state_sha256',)
+        if any(not isinstance(item.get(key), str) or not item[key] for key in required):
+            raise ValueError('Missing or invalid model state provenance')
+        if item[state_key] != base[state_key]:
+            raise ValueError(f'Unpaired reports: {state_key}')
     data_keys = ('image_size', 'event_image_size', 'context_frames', 'bins', 'rollout_steps',
                  'sample_history_frames', 'tolerance_us', 'alignment', 'alignment_evidence', 'evaluation_horizons')
     rows = []
@@ -38,9 +57,16 @@ def compare(reports, *, diagnostic=False):
                          precision=item['config']['runtime'].get('precision'),
                          configured_optimization=item['config'].get('optimization'),
                          trainable_parameters=item.get('trainable_parameters'),
+                         parameter_counts=item.get('parameter_counts'),
+                         reference_provenance=item.get('reference_provenance'),
+                         initialization_provenance=item.get('initialization_provenance'),
+                         predictor_initialization=item.get('predictor_initialization'),
+                         forecaster_state_sha256=item.get('forecaster_state_sha256'),
+                         predictor_state_sha256=item.get('predictor_state_sha256'),
                          model_settings=item['config'].get('model'),
                          transition_diagnostics=item.get('transition_diagnostics')))
     return dict(format='event-wm-comparison-v1', sample_digest=base['sample_digest'],
+                compatibility_state_key=state_key, compatibility_state_sha256=base[state_key],
                 evaluation_kind=expected_kind, num_samples=len(base['sample_ids']), rows=rows,
                 interpretation='Descriptive paired comparison only. Repeat seeds; inspect per-class and per-sequence results before causal or generalization claims.')
 

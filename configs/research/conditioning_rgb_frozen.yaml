@@ -1,0 +1,5 @@
+# Evaluate the configured original RGB predictor without loading a research checkpoint.
+extends: conditioning_warmup.yaml
+model:
+  mode: rgb
+  train_predictor: false

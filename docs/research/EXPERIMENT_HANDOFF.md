@@ -1,6 +1,8 @@
 # Event–RGB 世界模型实验交接
 
-本文是实验 Agent 的入口。先阅读 [研究方案](event-wm-plan.md)，再按本文件执行。代码实现的是研究假设的实验框架；没有预填真实 DSEC 训练结果。
+> **当前入口（2026-11-23）：** [Event motion-conditioned DINO-Foresight：方法与训练交接](DINOF_MOTION_CONDITIONING.md)。新版在完整 RGB Predictor 内引入历史事件条件，使用 `stage: conditioning` 与 `conditioning_*.yaml`，先训练条件分支，再联合微调 Predictor。当前分支从 fusion 基点建立，不要求旧转移教师或运动 rollout checkpoint。新版的训练命令、样本配对与评价口径以新文档为准。
+
+以下内容保留此前三阶段方案的历史记录。其部分后续阶段只存在于对应旧分支，不应作为当前分支的可用能力或训练步骤。代码实现的是研究假设的实验框架；没有预填真实 DSEC 训练结果。
 
 ## 1. 研究上下文与要回答的问题
 
