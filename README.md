@@ -10,8 +10,6 @@
 
 新研究代码与原 RGB 基线入口分开。阅读 [完整实验交接](docs/research/EXPERIMENT_HANDOFF.md) 和 [研究方案](docs/research/event-wm-plan.md)。实验按融合对照、观测转移、未来运动与多步推演三个累积分支组织；各分支支持范围与运行前提见交接文档。
 
-大批量时间注意力的 CUDA 修复与已有实验分支迁移见 [TemporalMixer 修复说明](docs/research/TEMPORAL_MIXER_FIX.md)。
-
 ## 安装与权重
 
 ```bash
