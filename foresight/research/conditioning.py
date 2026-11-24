@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from numbers import Real
+
 import torch
 from torch import Tensor, nn
 
@@ -88,6 +91,9 @@ class ConditioningWorldModel(nn.Module):
 
     def encode_events(self, events: Tensor) -> Tensor:
         """[B, intervals, bins, 2, H, W] -> [B, spatial, intervals*bins, hidden]."""
+        return self._encode_events(events)
+
+    def _encode_events(self, events: Tensor, diagnostics: dict[str, Tensor] | None = None) -> Tensor:
         if self.mode == "rgb":
             raise ValueError("RGB mode has no Event encoder")
         if not isinstance(events, Tensor) or events.ndim != 6:
@@ -103,27 +109,76 @@ class ConditioningWorldModel(nn.Module):
         encoded = encoded.flatten(2).transpose(1, 2).reshape(b, intervals, bins, spatial, self.hidden_dim)
         if self.mode == "event_pooled":
             encoded = encoded.mean(dim=2, keepdim=True).expand(-1, -1, bins, -1, -1)
+        if diagnostics is not None:
+            diagnostics["encoded_events"] = encoded.permute(0, 3, 1, 2, 4).reshape(
+                b, spatial, intervals * bins, self.hidden_dim)
         positions = self.interval_position + self.bin_position
         encoded = encoded + positions.unsqueeze(3)
-        return encoded.permute(0, 3, 1, 2, 4).reshape(b, spatial, intervals * bins, self.hidden_dim)
+        memory = encoded.permute(0, 3, 1, 2, 4).reshape(b, spatial, intervals * bins, self.hidden_dim)
+        if diagnostics is not None:
+            diagnostics["memory"] = memory
+        return memory
 
-    def _condition(self, future_hidden: Tensor, memory: Tensor) -> tuple[Tensor, Tensor]:
+    def _condition(self, future_hidden: Tensor, memory: Tensor, *, condition_mode="full",
+                   diagnostics: dict[str, Tensor] | None = None) -> tuple[Tensor, Tensor]:
         b, spatial, length, _ = memory.shape
         if future_hidden.shape != (b, spatial, self.predictor_dim):
             raise ValueError("future hidden map differs from configured predictor_dim/grid")
         query = self.query(future_hidden).reshape(b * spatial, 1, self.hidden_dim)
         memory = self.memory_norm(memory).reshape(b * spatial, length, self.hidden_dim)
         parts = []
+        attention_parts = [] if diagnostics is not None else None
         # Bound the spatial-site batch for CUDA SDPA, preserving the entire
         # historical time axis in each call and the gradients of all sites.
         for q, kv in zip(query.split(self.MAX_BATCH_SITES), memory.split(self.MAX_BATCH_SITES), strict=True):
-            value = q + self.cross_attention(q, kv, kv, need_weights=False)[0]
+            attention = (self.cross_attention(q, kv, kv, need_weights=False)[0]
+                         if condition_mode == "full" else torch.zeros_like(q))
+            value = q + attention
             parts.append(value + self.ffn(value))
+            if attention_parts is not None:
+                attention_parts.append(attention)
         features = torch.cat(parts).reshape(b, spatial, self.hidden_dim)
         motion = self.motion_head(features)
+        if diagnostics is not None:
+            diagnostics["query"] = query.reshape(b, spatial, self.hidden_dim)
+            diagnostics["attention"] = torch.cat(attention_parts).reshape(b, spatial, self.hidden_dim)
+            diagnostics["hidden"] = future_hidden
+            diagnostics["motion"] = motion
         return self.output(motion), motion
 
     def forward(self, z_history: Tensor, events_history: Tensor | None, base_predictor) -> dict[str, Tensor]:
+        return self._forward_impl(z_history, events_history, base_predictor)
+
+    def forward_diagnostic(self, z_history: Tensor, events_history: Tensor, base_predictor, *,
+                           condition_mode="full", condition_scale=1.0) -> dict[str, Tensor | dict[str, Tensor]]:
+        """Return a forecast and intermediate tensors without changing checkpoint keys.
+
+        ``full`` preserves ordinary forward arithmetic at scale 1. ``query_only``
+        removes the cross-attention contribution while retaining the RGB query
+        residual, FFN and projections. Scale applies to the final hidden update,
+        including its bias. Use the predictor directly for a complete bypass.
+
+        Diagnostic tensors retain their graph; callers select no-grad, detach,
+        or gradient probes. No activations are stored on the module. The event
+        tensors are [B,N,intervals*bins,hidden], query/attention are [B,N,hidden],
+        hidden/update are [B,N,predictor_dim], and motion is [B,N,motion_dim].
+        """
+        if self.mode == "rgb":
+            raise ValueError("forward_diagnostic requires an Event conditioning model")
+        if condition_mode not in {"full", "query_only"}:
+            raise ValueError("condition_mode must be 'full' or 'query_only'")
+        if (isinstance(condition_scale, bool) or not isinstance(condition_scale, Real)
+                or not math.isfinite(condition_scale)):
+            raise ValueError("condition_scale must be a finite real number")
+        diagnostics: dict[str, Tensor] = {}
+        result = self._forward_impl(z_history, events_history, base_predictor,
+                                    condition_mode=condition_mode, condition_scale=float(condition_scale),
+                                    diagnostics=diagnostics)
+        return {**result, "diagnostics": diagnostics}
+
+    def _forward_impl(self, z_history: Tensor, events_history: Tensor | None, base_predictor, *,
+                      condition_mode="full", condition_scale=1.0,
+                      diagnostics: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
         check_scene(z_history, self.grid_size, self.scene_dim, history_frames=self.history_frames)
         if not z_history.is_floating_point():
             raise ValueError("scene history must be floating point PCA tokens")
@@ -137,11 +192,16 @@ class ConditioningWorldModel(nn.Module):
             raise ValueError("Event conditioning requires historical events [B,intervals,bins,2,H,W]")
         if events_history.shape[0] != z_history.shape[0] or events_history.device != z_history.device:
             raise ValueError("RGB and Event histories must have the same batch and device")
-        memory = self.encode_events(events_history)
+        memory = self._encode_events(events_history, diagnostics)
         predicted_motion = []
 
         def conditioner(future_hidden):
-            update, motion = self._condition(future_hidden, memory)
+            update, motion = self._condition(future_hidden, memory, condition_mode=condition_mode,
+                                              diagnostics=diagnostics)
+            if condition_scale != 1.0:
+                update = update * condition_scale
+            if diagnostics is not None:
+                diagnostics["update"] = update
             predicted_motion.append(motion)
             return update
 

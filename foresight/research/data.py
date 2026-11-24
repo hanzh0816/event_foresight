@@ -247,6 +247,20 @@ class ResearchDSECDataset(Dataset):
     def __len__(self):
         return len(self.windows)
 
+    def read_history_events(self, index):
+        """Read only observed Event intervals, without RGB or future payloads.
+
+        This also supplies cross-sample donors to conditioning diagnostics.
+        Cached readers should retain the same interval path as __getitem__.
+        """
+        name, end = self.windows[index]
+        start = end - self.context_frames + 1
+        stops = self.exposures[name][:, 1]
+        return torch.stack([
+            self._event_interval(name, int(stops[i]), int(stops[i + 1]))
+            for i in range(start, end)
+        ])
+
     def __getitem__(self, index):
         name, end = self.windows[index]
         reader = self._reader(name)
@@ -259,7 +273,7 @@ class ResearchDSECDataset(Dataset):
         cutoff = int(stops[end])
         sample = {
             "history_rgb": torch.stack([self._rgb(reader, i) for i in range(start, end + 1)]),
-            "history_events": torch.stack([self._event_interval(name, a, b) for a, b in historical_intervals]),
+            "history_events": self.read_history_events(index),
             "targets": [_normalized_target(target) for target in targets],
             "meta": {
                 "sample_id": f"{name}:{end}", "sequence": name, "end": end,

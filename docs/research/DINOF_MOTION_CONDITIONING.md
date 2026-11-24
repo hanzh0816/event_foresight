@@ -2,6 +2,8 @@
 
 更新日期：2026-11-23。实现分支：`codex/event-dinof-motion-conditioning`，基点：`codex/event-wm-fusion@4132d60`。本文是当前方案入口；[旧方案](event-wm-plan.md) 和 [旧三阶段交接](EXPERIMENT_HANDOFF.md) 仅供追溯。
 
+2026-11-24 新增固定 checkpoint 的 [Event 内容依赖与梯度诊断](CONDITIONING_DIAGNOSTICS.md)，用于分析首轮结果中的条件分支作用；诊断不改变训练方法。
+
 ## 1. 研究问题与范围
 
 在相同历史 RGB 与观测截止时刻下，事件记录的帧间变化过程能否改善预训练场景特征的未来预测？进一步，有序的事件子窗是否比同一事件历史的时间汇聚更有效？
@@ -34,7 +36,7 @@ x_hat = (z_hat @ W + pca_mean) * std + mean
 
 每个 bin 独立经过共享 CNN，得到与 RGB patch 网格对应的空间 tokens。编码器保留 `3 intervals × 5 bins` 的时间轴，提供区间/bin 的时间位置信息。它从当前预测目标初始化训练，不加载旧 Event-only RGB 对齐编码器。
 
-`event_ordered` 保留 bin 顺序。`event_pooled` 在每个区间内部对 5 个 bin 特征取均值并复制，再加入与有序组相同的区间/bin 位置编码。它保留 3 个历史区间的先后关系，去掉每个区间内部的 bin 顺序；两组使用相同事件范围、空间处理、参数量与 attention 形状。
+`event_ordered` 保留 bin 顺序。`event_pooled` 在每个区间内部对 5 个 bin 特征取均值并复制，再加入与有序组相同的区间/bin 位置编码。它保留 3 个历史区间的先后关系，同时消除区间内各 bin 的内容差异与顺序信息；两组使用相同事件范围、空间处理、参数量与 attention 形状。
 
 ### 第 6 层后的条件注入
 
