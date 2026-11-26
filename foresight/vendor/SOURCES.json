@@ -7,14 +7,6 @@
       "Package-private relative imports; no torch.hub"
     ]
   },
-  "dinof": {
-    "repository": "https://github.com/Sta8is/DINO-Foresight",
-    "revision": "3ccd0f75ce08a8b43109a5c5d423823aee0e0f61",
-    "changes": [
-      "Only src/attention_masked.py retained; forward unmodified",
-      "Trailing whitespace removed; Python AST unchanged"
-    ]
-  },
   "detector": {
     "repository": "https://github.com/fundamentalvision/Deformable-DETR",
     "license": "Apache-2.0",

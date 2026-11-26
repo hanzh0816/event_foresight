@@ -528,7 +528,7 @@ $$
 | 工作 | 参考接口与判断依据 | 论文／GitHub |
 |---|---|---|
 | **DINOv2 / DINOv3** | 图像预训练的 dense patch 特征；分别是 GEP 与 ScalE 的主要教师来源。教师版本、层、patch stride 和是否带 registers 会改变对齐目标 | [DINOv2论文](https://arxiv.org/abs/2304.07193) · [DINOv2 GitHub](https://github.com/facebookresearch/dinov2) · [DINOv3官方仓库及论文入口](https://github.com/facebookresearch/dinov3) |
-| **DINO-Foresight** | 冻结图像 encoder，在特征空间学习未来预测，再由任务头读取；本仓库基线还包含 PCA / inverse PCA 接口 | [论文](https://arxiv.org/abs/2412.11673) · [Sta8is/DINO-Foresight](https://github.com/Sta8is/DINO-Foresight) |
+| **DINO-Foresight** | 冻结图像 encoder，在特征空间学习未来预测，再由任务头读取；本仓库旧基线采用 PCA / inverse PCA 接口，当前 DINO-world 基线直接预测 768 维特征 | [论文](https://arxiv.org/abs/2412.11673) · [Sta8is/DINO-Foresight](https://github.com/Sta8is/DINO-Foresight) |
 | **DINO-world / Back to the Features** | 在 DINOv2 空间从过去帧预测未来特征，可再做动作条件适配；用于参考通用视频动态建模 | [论文](https://arxiv.org/abs/2507.19468) · [作者页面](https://baldassarrefe.github.io/publication/dino-world-2025/)；未确认官方 GitHub |
 | **DINO-WM** | DINO patch 状态＋动作条件转移＋规划；可参考空间特征状态，但当前项目无动作输入 | [论文](https://arxiv.org/abs/2411.04983) · [gaoyuezhou/dino_wm](https://github.com/gaoyuezhou/dino_wm)。与上一行是不同工作 |
 | **V-JEPA / V-JEPA 2** | 视频 encoder、target encoder 与 masked latent prediction；默认掩码预训练不等于只看过去的 forecasting。若替换图像教师，需在编码前隔离历史与未来，并避免跨 cutoff 的 tubelets | [V-JEPA论文](https://arxiv.org/abs/2404.08471) · [facebookresearch/jepa](https://github.com/facebookresearch/jepa)；[V-JEPA 2论文](https://arxiv.org/abs/2506.09985) · [facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2) |

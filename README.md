@@ -48,7 +48,7 @@ python scripts/link_checkpoints.py --root /data3/hzh/models/dino_world
 
 脚本将项目内 `checkpoints` 链接至该目录；不会覆盖已有目录或其他软链接。如果已有 `checkpoints`，直接将 YAML 中的 `model.encoder_checkpoint` 设置为下载文件的绝对路径。构建模型时使用 `weights_only=True` 严格加载官方原始 state_dict，不自动下载、不调用 torch.hub。模型入口支持 PyTorch 新旧序列化格式。
 
-DINO-world predictor 与 768 维检测头均需后续训练生成 checkpoint。旧 `dinof.pt`、1152 维 PCA predictor 和 3072 维 `detector.pt` 无法用于新路径。`scripts/import_weights.py` 仅保留旧 DINO-Foresight 权重转换用途。
+DINO-world predictor 与 768 维检测头均需后续训练生成 checkpoint。旧 DINO-Foresight 权重与当前模型不兼容。
 
 ## 后续训练入口
 
@@ -115,4 +115,4 @@ python -m pytest -q
 
 CPU 单元测试检查 3D RoPE、各时间边界的因果性、teacher-forcing loss、冻结 encoder、分块与 activation checkpointing 的输出/梯度、完整训练状态恢复以及原有数据/评测合同。测试使用微型模型和合成数据；真实 encoder 权重加载、CUDA/BF16 与 DSEC AP 仍需在权重和数据就绪后验证。
 
-相关文献见 [Event 表征调研](docs/event-representation-survey.md)。保留的旧模型/vendor 代码用于旧资产转换及回归测试；默认配置、训练、推理和评测入口已切换至 DINO-world。来源与许可证见 [SOURCES.json](foresight/vendor/SOURCES.json) 和 [检测模块许可证](foresight/models/APACHE-LICENSE)。权重与 outputs 不提交到 Git。
+相关文献见 [Event 表征调研](docs/event-representation-survey.md)。本分支仅保留 DINO-world 模型及其 DSEC 训练、推理和评测路径。来源与许可证见 [SOURCES.json](foresight/vendor/SOURCES.json) 和 [检测模块许可证](foresight/models/APACHE-LICENSE)。权重与 outputs 不提交到 Git。

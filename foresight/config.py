@@ -43,12 +43,13 @@ def load_config(filename):
         raise ValueError("The unchanged DSEC protocol requires frame_interval_s=0.05")
     if not isinstance(model.get("predictor", {}), dict):
         raise ValueError("model.predictor must be a mapping")
-    if model.get("dinof_checkpoint"):
-        raise ValueError("DINO-world requires model.encoder_checkpoint; DINO-Foresight weights are incompatible")
+    unknown_model_keys = model.keys() - {"encoder_checkpoint", "predictor_checkpoint", "predictor"}
+    if unknown_model_keys:
+        raise ValueError(f"Unsupported model configuration fields: {sorted(unknown_model_keys)}")
     if runtime["precision"] not in ("bf16-mixed", "32-true"):
         raise ValueError("precision must be bf16-mixed or 32-true")
     for container, keys in ((data, ("root",)),
-                            (model, ("encoder_checkpoint", "detector_checkpoint", "predictor_checkpoint"))):
+                            (model, ("encoder_checkpoint", "predictor_checkpoint"))):
         for key in keys:
             if container.get(key):
                 container[key] = str(resolve_path(container[key]))

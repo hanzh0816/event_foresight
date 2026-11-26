@@ -64,8 +64,7 @@ def config(tmp_path):
     return {
         "data": {"root": str(tmp_path), "image_size": [2, 2], "context_frames": 4,
                  "sample_history_frames": 40, "batch_size": 2, "num_workers": 0},
-        "model": {"encoder_checkpoint": "unused.pt", "predictor_checkpoint": None,
-                  "detector_checkpoint": None},
+        "model": {"encoder_checkpoint": "unused.pt", "predictor_checkpoint": None},
         "optimization": {"epochs": 3, "max_steps": 2, "accumulation_steps": 1,
                          "lr": 1e-3, "weight_decay": 0.0, "scheduler": "constant",
                          "clip_grad": 1.0, "predictor_dropout": False},
@@ -252,7 +251,6 @@ def test_scratch_detector_architecture_is_saved_and_restored(tmp_path, monkeypat
     assert architecture["hidden_dim"] == 8
     monkeypatch.setattr("foresight.checkpoints.read_checkpoint", lambda path: payload)
     restored_config = resume_config(config(tmp_path), "unused.ckpt", "detector")
-    assert restored_config["model"]["detector_checkpoint"] is None
     assert restored_config["detector"]["hidden_dim"] == 8
     restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
     restored.on_load_checkpoint(payload)
@@ -274,13 +272,10 @@ def test_teacher_forcing_supervises_every_shifted_frame(tmp_path):
     assert task(batch["history_rgb"]).shape == (2, 4, 1, 2)
 
 
-def test_detector_rejects_untrained_predictor_and_old_head(tmp_path):
+def test_detector_rejects_untrained_predictor(tmp_path):
     cfg = config(tmp_path)
     with pytest.raises(ValueError, match="requires model.predictor_checkpoint"):
         DetectorTask(cfg, forecaster=TinyForecaster())
-    cfg["model"]["detector_checkpoint"] = "old_dinof_detector.pt"
-    with pytest.raises(ValueError, match="incompatible"):
-        DetectorTask(cfg, forecaster=TinyForecaster(), allow_uninitialized_predictor=True)
 
 
 def test_warmup_constant_schedule_and_best_predictor_selection(tmp_path, monkeypatch):

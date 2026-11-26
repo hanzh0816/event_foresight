@@ -18,13 +18,3 @@ def normalize_hw(value, name="size"):
            for item in dimensions):
         raise ValueError(f"{name} must contain positive integers, got {value!r}")
     return tuple(int(item) for item in dimensions)
-
-
-def patch_grid(image_size, patch_size=14):
-    """Return the patch grid, rejecting dimensions that would drop border pixels."""
-    height, width = normalize_hw(image_size, "image_size")
-    patch_height, patch_width = normalize_hw(patch_size, "patch_size")
-    if height % patch_height or width % patch_width:
-        raise ValueError(f"image_size {(height, width)} must be divisible by patch_size "
-                         f"{(patch_height, patch_width)}")
-    return height // patch_height, width // patch_width

@@ -16,7 +16,6 @@ data:
 
 model:
   encoder_checkpoint: checkpoints/dinov2_vitb14_reg4_pretrain.pth
-  detector_checkpoint: null # Old DINO-Foresight detector assets are incompatible.
   predictor_checkpoint: null # Supply --predictor-checkpoint when training the head.
   predictor:
     hidden_dim: 768
@@ -26,7 +25,7 @@ model:
     dropout: 0.0
     query_chunk_size: 1024 # Independent queries; 0 disables chunking.
 
-detector: # Used when model.detector_checkpoint is null (train a new head from scratch).
+detector: # Train a new detection head on the frozen DINO-world features.
   hidden_dim: 256
   num_classes: 8
   num_queries: 300

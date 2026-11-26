@@ -1,4 +1,4 @@
-"""Public entry points must remain independent of the old checkout."""
+"""Public entry points use private dependencies and explicit configuration."""
 
 from copy import deepcopy
 import json
@@ -16,15 +16,15 @@ from foresight.config import ROOT, load_config
 from foresight.evaluate import read_sample_ids
 
 
-def test_imports_from_unrelated_directory_without_old_packages(tmp_path):
+def test_imports_from_unrelated_directory_without_unused_dependencies(tmp_path):
     script = '''
 import importlib.abc
 import sys
-class BlockOld(importlib.abc.MetaPathFinder):
+class BlockUnusedDependencies(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'dinof_future_detect','event_dinof','future_detect','future_features','dsec_data','dinov2'}:
+        if fullname.split('.')[0] in {'dinov2', 'dsec_data', 'einops'}:
             raise AssertionError('forbidden runtime dependency: '+fullname)
-sys.meta_path.insert(0,BlockOld())
+sys.meta_path.insert(0,BlockUnusedDependencies())
 import foresight.infer
 assert 'lightning' not in sys.modules
 import foresight.evaluate
@@ -32,7 +32,9 @@ import foresight.train
 from foresight.config import load_config
 assert load_config('configs/detector.yaml')['model']['encoder_checkpoint'].endswith('dinov2_vitb14_reg4_pretrain.pth')
 '''
-    env = dict(os.environ, PYTHONPATH=str(ROOT), CUDA_VISIBLE_DEVICES="")
+    # Bound native thread pools in this fresh process, as in the CPU model tests.
+    env = dict(os.environ, PYTHONPATH=str(ROOT), CUDA_VISIBLE_DEVICES="",
+               OMP_NUM_THREADS="2", MKL_NUM_THREADS="2", OPENBLAS_NUM_THREADS="1")
     result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path,
                             env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -44,6 +46,15 @@ def test_config_paths_are_project_relative(tmp_path, monkeypatch):
     assert Path(config["model"]["encoder_checkpoint"]).is_absolute()
     assert config["data"]["image_size"] == [448, 896]
     assert config["runtime"]["encoder_chunk_size"] == 1
+
+
+@pytest.mark.parametrize("key", ["detector_checkpoint", "dinof_checkpoint", "unknown_option"])
+def test_config_rejects_unsupported_model_options(tmp_path, key):
+    config = {"model": {"encoder_checkpoint": "unused.pth", key: None}}
+    path = tmp_path / "unsupported.yaml"
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match=key):
+        load_config(path)
 
 
 def test_manifest_preserves_order_and_rejects_duplicates(tmp_path):

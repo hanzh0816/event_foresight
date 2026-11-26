@@ -52,7 +52,7 @@ def trained_detector(tmp_path, monkeypatch):
         source.forecaster.predictor.weight.fill_(1.25)
         source.forecaster.predictor.bias.fill_(1.5)
     config = dict(model=dict(encoder_checkpoint=str(tmp_path / "unused_dinov2.pth"),
-                             detector_checkpoint=None, predictor_checkpoint=None),
+                             predictor_checkpoint=None),
                   data=dict(image_size=[28, 42], context_frames=4),
                   runtime=dict(encoder_chunk_size=1))
     payload = dict(foresight_format=TRAINING_FORMAT, stage="detector",
@@ -84,11 +84,8 @@ def predictor_override(case):
                 forecaster_architecture=deepcopy(case.payload["forecaster_architecture"]))
 
 
-@pytest.mark.parametrize("configured_asset", [False, True], ids=["no-head-asset", "missing-head-asset"])
-def test_trained_detector_restores_without_original_head_asset(trained_detector, configured_asset):
+def test_trained_detector_restores_complete_pipeline(trained_detector):
     case = trained_detector
-    if configured_asset:
-        case.config["model"]["detector_checkpoint"] = str(case.directory / "deleted_detector.pt")
     restored = pipeline.load_pipeline(case.config, case.checkpoint)
     assert_state_equal(restored.state_dict(), case.payload["state_dict"])
     assert restored.detector.grid_hw == (2, 3)

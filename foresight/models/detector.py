@@ -16,33 +16,6 @@ from .attention import MultiScaleDeformableAttention
 from .boxes import box_cxcywh_to_xyxy
 
 
-DETECTOR_FORMAT = "event-foresight-detector-v1"
-
-
-def load_detector(checkpoint):
-    """Load the exported RGB detector; no training framework or data required."""
-    from .forecaster import read_weights
-    saved = read_weights(checkpoint, DETECTOR_FORMAT)
-    architecture = saved.get("architecture")
-    if not isinstance(architecture, dict):
-        raise ValueError("Detector export has no architecture")
-    expected = {"feature_dim", "grid_size", "hidden_dim", "num_classes", "num_queries",
-                "num_levels", "encoder_layers", "decoder_layers", "heads", "points", "mlp_dim", "dropout"}
-    if set(architecture) != expected:
-        raise ValueError("Detector export architecture fields are incomplete or unexpected")
-    if architecture["feature_dim"] != 3072 or tuple(architecture["grid_size"]) != (32, 64) or architecture["num_classes"] != 8:
-        raise ValueError("Detector export does not match the RGB DSEC baseline feature/class contract")
-    with torch.device("meta"):
-        model = FutureDetector(**architecture)
-    model.load_state_dict(saved["state_dict"], strict=True, assign=True)
-    if any(value.is_meta for value in model.state_dict().values()):
-        raise RuntimeError("Detector export did not materialize every tensor")
-    model.architecture = architecture
-    model.input_spec = saved.get("input_spec", {})
-    model.provenance = saved.get("provenance", {})
-    return model
-
-
 def inverse_sigmoid(x):
     return torch.logit(x.float().clamp(1e-5, 1 - 1e-5))
 

@@ -88,7 +88,6 @@ def resume_config(config, checkpoint, stage):
     # Full resume will restore all parameter values. Only the initial asset
     # locations are taken from today's config; no old checkout is required.
     restored["model"]["encoder_checkpoint"] = config["model"]["encoder_checkpoint"]
-    restored["model"]["detector_checkpoint"] = None
     restored["model"]["predictor_checkpoint"] = None
     if stage == "detector":
         architecture = saved.get("detector_architecture")

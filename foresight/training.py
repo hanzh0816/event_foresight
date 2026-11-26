@@ -282,8 +282,6 @@ class DetectorTask(_RGBTask):
 
     def __init__(self, config, *, forecaster=None, detector=None, criterion=None,
                  allow_uninitialized_predictor=False):
-        if config["model"].get("detector_checkpoint"):
-            raise ValueError("Use --resume for a DINO World Detector; imported DINO-Foresight heads are incompatible")
         if not config["model"].get("predictor_checkpoint") and not allow_uninitialized_predictor:
             raise ValueError("Detector training requires model.predictor_checkpoint from trained DINO World, or --resume")
         super().__init__(config, forecaster=forecaster)
