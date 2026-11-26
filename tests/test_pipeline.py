@@ -1,4 +1,4 @@
-"""CPU regression tests for full Detector restoration and Predictor overrides."""
+"""Shared detector loading keeps predictor weights and feature contracts separate."""
 
 from copy import deepcopy
 from types import SimpleNamespace
@@ -13,22 +13,27 @@ from foresight.models.detector import FutureDetector
 
 
 class TinyForecaster(nn.Module):
-    """Replace only the large asset-backed model, preserving component namespaces."""
-
     image_size = (28, 42)
     history_length = 4
     feature_dim = 4
     grid_size = (2, 3)
     feature_space = "tiny-last-layer"
-    architecture = {"name": "tiny-world", "history_length": 4, "frame_interval_s": 0.05}
+    architecture = {"model": "tiny-world-v31", "history_length": 4,
+                    "frame_interval_s": 0.05, "feature_space": feature_space,
+                    "feature_dim": feature_dim, "image_size": list(image_size),
+                    "predictor": {"depth": 2, "event_enabled": False}}
 
     def __init__(self):
         super().__init__()
         self.encoder = nn.Linear(2, 2)
         self.predictor = nn.Linear(2, 2)
+        self.event_encoder = None
+        self.architecture = deepcopy(type(self).architecture)
         with torch.no_grad():
-            for parameter in self.parameters():
-                parameter.zero_()
+            self.encoder.weight.fill_(0.25)
+            self.encoder.bias.fill_(0.5)
+            self.predictor.weight.zero_()
+            self.predictor.bias.zero_()
 
 
 def assert_state_equal(actual, expected):
@@ -45,14 +50,12 @@ def trained_detector(tmp_path, monkeypatch):
                         points=1, mlp_dim=16, dropout=0.0)
     source = pipeline.ForecastDetector(TinyForecaster(), FutureDetector(**architecture))
     with torch.no_grad():
-        # Distinguish every saved component from the fresh forecaster. The
-        # override guard must compare against restored encoder, not initial assets.
-        source.forecaster.encoder.weight.fill_(0.25)
-        source.forecaster.encoder.bias.fill_(0.5)
+        # The head checkpoint contains an untrained predictor. Its distinct
+        # values must never replace the separately trained prediction weights.
         source.forecaster.predictor.weight.fill_(1.25)
         source.forecaster.predictor.bias.fill_(1.5)
     config = dict(model=dict(encoder_checkpoint=str(tmp_path / "unused_dinov2.pth"),
-                             predictor_checkpoint=None),
+                             predictor_checkpoint=str(tmp_path / "predictor.ckpt")),
                   data=dict(image_size=[28, 42], context_frames=4),
                   runtime=dict(encoder_chunk_size=1))
     payload = dict(foresight_format=TRAINING_FORMAT, stage="detector",
@@ -62,6 +65,13 @@ def trained_detector(tmp_path, monkeypatch):
                    state_dict=deepcopy(source.state_dict()))
     checkpoint = tmp_path / "detector.ckpt"
     torch.save(payload, checkpoint)
+    predictor = {name: value.clone() for name, value in payload["state_dict"].items()
+                 if name.startswith("forecaster.")}
+    predictor["forecaster.predictor.weight"].fill_(7.0)
+    predictor["forecaster.predictor.bias"].fill_(-3.0)
+    predictor_payload = dict(foresight_format=TRAINING_FORMAT, stage="predictor", state_dict=predictor,
+                             forecaster_architecture=deepcopy(source.forecaster.architecture))
+    torch.save(predictor_payload, config["model"]["predictor_checkpoint"])
     created = []
 
     def create_forecaster(checkpoint, *, encoder_chunk_size, **kwargs):
@@ -72,22 +82,15 @@ def trained_detector(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pipeline, "DINOWorldForecaster", create_forecaster)
     return SimpleNamespace(config=config, payload=payload, checkpoint=checkpoint,
-                           directory=tmp_path, created=created)
+                           predictor_payload=predictor_payload, directory=tmp_path, created=created)
 
 
-def predictor_override(case):
-    state = {name: value.clone() for name, value in case.payload["state_dict"].items()
-             if name.startswith("forecaster.")}
-    state["forecaster.predictor.weight"].fill_(7.0)
-    state["forecaster.predictor.bias"].fill_(-3.0)
-    return dict(foresight_format=TRAINING_FORMAT, stage="predictor", state_dict=state,
-                forecaster_architecture=deepcopy(case.payload["forecaster_architecture"]))
-
-
-def test_trained_detector_restores_complete_pipeline(trained_detector):
+def test_pipeline_assembles_shared_head_and_separate_trained_predictor(trained_detector):
     case = trained_detector
     restored = pipeline.load_pipeline(case.config, case.checkpoint)
-    assert_state_equal(restored.state_dict(), case.payload["state_dict"])
+    expected = deepcopy(case.payload["state_dict"])
+    expected.update(case.predictor_payload["state_dict"])
+    assert_state_equal(restored.state_dict(), expected)
     assert restored.detector.grid_hw == (2, 3)
     assert restored.detector.query_embedding.weight.shape == (3, 16)
     assert all(value.device.type == "cpu" for value in restored.state_dict().values())
@@ -95,8 +98,19 @@ def test_trained_detector_restores_complete_pipeline(trained_detector):
     assert all(not parameter.requires_grad for parameter in restored.parameters())
 
 
+def test_persistence_loads_only_shared_head_and_encoder(trained_detector):
+    case = trained_detector
+    case.config["model"]["predictor_checkpoint"] = None
+    case.config["model"]["detector_checkpoint"] = str(case.checkpoint)
+    restored = pipeline.load_pipeline(case.config, persistence=True)
+    expected = {name.removeprefix("detector."): value for name, value in case.payload["state_dict"].items()
+                if name.startswith("detector.")}
+    assert_state_equal(restored.detector.state_dict(), expected)
+    assert all(torch.count_nonzero(value) == 0 for value in restored.forecaster.predictor.parameters())
+
+
 @pytest.mark.parametrize("corruption", ["missing", "unexpected"])
-def test_trained_detector_requires_a_strict_complete_state(trained_detector, corruption):
+def test_shared_detector_requires_strict_head_weights(trained_detector, corruption):
     case = trained_detector
     if corruption == "missing":
         del case.payload["state_dict"]["detector.class_heads.0.bias"]
@@ -109,71 +123,77 @@ def test_trained_detector_requires_a_strict_complete_state(trained_detector, cor
         pipeline.load_pipeline(case.config, case.checkpoint)
 
 
-def test_explicit_predictor_overrides_restored_predictor_last(trained_detector):
+@pytest.mark.parametrize("checkpoint_kind", ["detector", "predictor"])
+@pytest.mark.parametrize("key", ["weight", "bias"])
+def test_shared_head_and_predictor_reject_changed_frozen_encoder(trained_detector, checkpoint_kind, key):
     case = trained_detector
-    override = predictor_override(case)
-    path = case.directory / "predictor.ckpt"
-    torch.save(override, path)
-    case.config["model"]["predictor_checkpoint"] = str(path)
-    restored = pipeline.load_pipeline(case.config, case.checkpoint)
-    expected = deepcopy(case.payload["state_dict"])
-    for name, value in override["state_dict"].items():
-        if name.startswith("forecaster.predictor."):
-            assert not torch.equal(value, expected[name])
-            expected[name] = value
-    # Full-state comparison also proves that Encoder and Detector survive
-    # the override unchanged, rather than merely checking the new P weights.
-    assert_state_equal(restored.state_dict(), expected)
-    assert all(not parameter.requires_grad for parameter in restored.parameters())
-
-
-@pytest.mark.parametrize("component,key", [("encoder", "weight"), ("encoder", "bias")])
-def test_predictor_override_rejects_incompatible_frozen_coordinates(trained_detector, component, key):
-    case = trained_detector
-    override = predictor_override(case)
-    override["state_dict"][f"forecaster.{component}.{key}"].add_(1.0)
-    path = case.directory / "incompatible_predictor.ckpt"
-    torch.save(override, path)
-    case.config["model"]["predictor_checkpoint"] = str(path)
-    with pytest.raises(ValueError, match=f"different frozen {component}"):
+    payload = case.payload if checkpoint_kind == "detector" else case.predictor_payload
+    payload["state_dict"][f"forecaster.encoder.{key}"].add_(1.0)
+    path = case.checkpoint if checkpoint_kind == "detector" else case.config["model"]["predictor_checkpoint"]
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="different frozen encoder"):
         pipeline.load_pipeline(case.config, case.checkpoint)
-    expected = {name.removeprefix("forecaster.predictor."): value
-                for name, value in case.payload["state_dict"].items()
-                if name.startswith("forecaster.predictor.")}
-    # The failed override must not partially replace the trained Detector's P.
-    assert_state_equal(case.created[-1].predictor.state_dict(), expected)
+    assert all(torch.count_nonzero(value) == 0 for value in case.created[-1].predictor.parameters())
 
 
-def test_inference_requires_trained_world_detector_before_loading_assets(trained_detector):
+def test_inference_requires_head_and_predictor_paths_before_constructing_models(trained_detector):
     case = trained_detector
-    with pytest.raises(ValueError, match="trained DINO World Detector"):
+    with pytest.raises(ValueError, match="shared Detector"):
         pipeline.load_pipeline(case.config)
-    case.payload["foresight_format"] = "event-foresight-training-v1"
-    torch.save(case.payload, case.checkpoint)
-    with pytest.raises(ValueError, match="DINO World Detector"):
+    case.config["model"]["predictor_checkpoint"] = None
+    with pytest.raises(ValueError, match="model.predictor_checkpoint"):
         pipeline.load_pipeline(case.config, case.checkpoint)
     assert not case.created
 
 
-@pytest.mark.parametrize("field", ["forecaster_architecture", "input_spec", "detector_architecture"])
-def test_inference_rejects_model_or_protocol_mismatch(trained_detector, field):
+@pytest.mark.parametrize("field,value", [("feature_dim", 3), ("grid_size", [1, 6]), ("num_classes", 9)])
+def test_shared_head_rejects_feature_grid_or_class_mismatch(trained_detector, field, value):
     case = trained_detector
-    case.payload[field] = {}
+    case.payload["detector_architecture"][field] = value
     torch.save(case.payload, case.checkpoint)
-    with pytest.raises(ValueError, match="architecture|protocol|contract"):
+    with pytest.raises(ValueError, match="feature space|grid"):
         pipeline.load_pipeline(case.config, case.checkpoint)
 
 
 @pytest.mark.parametrize("change", ["architecture", "dtype"])
-def test_predictor_override_rejects_semantic_or_encoder_dtype_mismatch(trained_detector, change):
+def test_predictor_rejects_semantic_or_encoder_dtype_mismatch(trained_detector, change):
     case = trained_detector
-    override = predictor_override(case)
+    payload = case.predictor_payload
     if change == "architecture":
-        override["forecaster_architecture"]["frame_interval_s"] = 0.1
+        payload["forecaster_architecture"]["frame_interval_s"] = 0.1
     else:
-        override["state_dict"]["forecaster.encoder.weight"] = override["state_dict"]["forecaster.encoder.weight"].double()
-    path = case.directory / "wrong_predictor.ckpt"
-    torch.save(override, path)
-    case.config["model"]["predictor_checkpoint"] = str(path)
+        payload["state_dict"]["forecaster.encoder.weight"] = payload["state_dict"]["forecaster.encoder.weight"].double()
+    torch.save(payload, case.config["model"]["predictor_checkpoint"])
     with pytest.raises(ValueError, match="architecture|frozen encoder"):
+        pipeline.load_pipeline(case.config, case.checkpoint)
+
+
+def test_head_predictor_architecture_can_differ_from_forecast_model(trained_detector):
+    case = trained_detector
+    case.payload["forecaster_architecture"]["predictor"] = {"depth": 8, "event_enabled": True}
+    # Detector training has no dependency on these untrained predictor tensors.
+    for name in list(case.payload["state_dict"]):
+        if name.startswith("forecaster.predictor."):
+            del case.payload["state_dict"][name]
+    torch.save(case.payload, case.checkpoint)
+    restored = pipeline.load_pipeline(case.config, case.checkpoint)
+    assert torch.equal(restored.forecaster.predictor.weight,
+                       case.predictor_payload["state_dict"]["forecaster.predictor.weight"])
+
+
+def test_detector_checkpoint_cannot_supply_prediction_weights(trained_detector):
+    case = trained_detector
+    case.config["model"]["predictor_checkpoint"] = str(case.checkpoint)
+    with pytest.raises(ValueError, match="[Pp]redictor"):
+        pipeline.load_pipeline(case.config, case.checkpoint)
+
+
+@pytest.mark.parametrize('key,value', [('feature_space', 'different-space'),
+                                       ('image_size', [42, 28]),
+                                       ('preprocessing', 'different-normalization')])
+def test_shared_head_rejects_feature_preprocessing_contract_changes(trained_detector, key, value):
+    case = trained_detector
+    case.payload['input_spec'][key] = value
+    torch.save(case.payload, case.checkpoint)
+    with pytest.raises(ValueError, match='protocol|feature|preprocessing'):
         pipeline.load_pipeline(case.config, case.checkpoint)

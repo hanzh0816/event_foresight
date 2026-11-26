@@ -6,7 +6,7 @@ from pathlib import Path
 import h5py
 import hdf5plugin  # Registers DSEC compression filters.
 import numpy as np
-from .definitions import WindowUnavailableError, require_int
+from .definitions import MissingDataError, WindowUnavailableError, require_int
 
 
 class H5HandleCache:
@@ -67,8 +67,19 @@ class EventStream:
     def event_metadata(self):
         if self._event_meta is None:
             handle = self._handles.get(self.event_path)
+            required = [f"events/{key}" for key in ("t", "x", "y", "p")] + ["t_offset", "ms_to_idx"]
+            missing = [key for key in required if key not in handle]
+            if missing:
+                raise MissingDataError(f"{self.event_path}: missing HDF5 fields {missing}")
+            count = len(handle["events/t"])
+            if count == 0:
+                raise MissingDataError(f"{self.event_path}: empty event stream has no timestamp coverage")
+            if any(len(handle[f"events/{key}"]) != count for key in ("x", "y", "p")):
+                raise MissingDataError(f"{self.event_path}: event fields have different lengths")
+            if len(handle["ms_to_idx"]) == 0:
+                raise MissingDataError(f"{self.event_path}: ms_to_idx must not be empty")
             self._event_meta = {
-                "count": len(handle["events/t"]),
+                "count": count,
                 "offset_us": int(handle["t_offset"][()]),
                 "first_local_us": int(handle["events/t"][0]),
                 "last_local_us": int(handle["events/t"][-1]),

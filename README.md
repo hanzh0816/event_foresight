@@ -1,124 +1,64 @@
-# Event Foresight — DINO-world baseline
+# Event Foresight v3.1
 
-本分支以 [DINO-world: Back to the Features](https://arxiv.org/abs/2507.19468) 为主要 RGB baseline，在 DSEC 上预测未来目标检测。分支 `codex/dino-world-baseline` 从 `558ed53` 创建；该提交包含独立 RGB baseline、DSEC 数据检查和现有评测流程。
+用历史 RGB 与事件预测 DSEC 下一时刻的 DINOv2 特征，再用共享冻结检测头评测未来目标检测。默认间隔 50 ms，四帧历史；模型由冻结 DINOv2、RVT-S 和 8 层双路 Cross-Attention 预测器组成。
 
-```text
-四张历史 RGB → 冻结 DINOv2 ViT-B/14-reg → 768 维最后层 patch features
-             → DINO-world causal cross-attention predictor → 未来 features
-             → 新训练的 Deformable DETR → 原图坐标的检测框、类别和分数
-```
+实现以项目 v3.1 设计为准。架构、监督、消融与服务器验收说明见 [docs/v31.md](docs/v31.md)。最终集成目前仅完成静态源码检查，尚未进行集成运行或 DSEC 训练评测。
 
-输入仍为间隔约 50ms 的四张 640×480 历史图像，默认 resize 至 448×896，预测未来 50ms。DSEC 读取、40 帧 sample inventory、train/val/test split、标注处理、COCO AP/AR、样本配对与预测导出逻辑保持不变。
+## 安装、权重与数据
 
-截至 2026-11-26 的来源核查未找到作者公开的 DINO-world predictor 代码或预训练权重。本分支根据论文实现 predictor，在 DSEC 上从随机初始化训练；encoder 使用官方预训练权重。这是 DINO-world 方法的 DSEC 实现，尚无训练结果，不代表论文大规模视频预训练模型的复现结果。
-
-## 模型与监督
-
-- Encoder：冻结 `dinov2_vitb14_reg`；逐帧提取最后一个 block 经最终 LayerNorm 后的 patch tokens，丢弃 CLS/register tokens。不使用多层拼接、PCA 或额外 L2 normalization。默认网格为 32×64，每个 token 为 768 维。
-- Predictor：论文 Base 尺寸，12 层、宽度 768、12 heads、MLP ratio 4；每个 query 从同一个可学习向量初始化，各层为 pre-LN cross-attention 与 residual MLP，末尾 LayerNorm 和线性输出。没有 query self-attention，context 不随层更新。
-- 位置编码：每个 head 的 60 维分成时间、纵坐标、横坐标各 20 维，剩余 4 维不旋转；空间坐标使用 `[-1,1]` 网格，时间使用秒。
-- 因果监督：历史 `z0,z1,z2,z3` 对应 query 时刻 `t1,t2,t3,t4`；各 query 只读 `t_context < t_query` 的 context。targets 为 `z1,z2,z3,z4`，其中 `z4` 由独立的未来 RGB 编码得到，全部 stop-gradient。训练平均所有四步、空间位置和 feature 维度上的 `SmoothL1(beta=0.1)`。
-- 推理：检测只用四张历史 RGB，返回 `t4` 特征。`predict_at` 支持显式时间，`rollout` 支持潜特征自回归反馈；当前 DSEC AP 评测仍只测 +50ms，未新增多步评测。
-
-论文没有公开全部工程细节。本实现明确采用 PyTorch Linear 默认初始化、query `Normal(0,0.02)`、带 bias 的 Q/K/V/output projections、GELU、LayerNorm `eps=1e-5`、无 LayerScale、默认 dropout=0、AdamW betas `(0.9,0.999)`。RoPE 将论文的 `10**linspace(-2,2,10)` 解释为周期，按 `2*pi*coordinate/period` 旋转相邻二维对；空间网格取端点，单点维度取 0。上述选择不承诺与未发布的官方 checkpoint 兼容。
-
-DSEC 适配沿用四帧、名义 50ms 时间间隔与原 resize，训练序列合计五帧；论文的大规模预训练使用八帧、变帧率及不同分辨率阶段。这里没有更改 DSEC reader 来引入 variable-FPS。自回归 API 使用固定长度滑动 context。默认按 1024 个 query 分块计算 attention，并在每层只投影一次 context K/V；可启用 activation checkpointing。Base 全局时空 attention 的实际显存需求仍需在目标 GPU 上验证。
-
-## 安装与手动下载权重
+以下命令在训练服务器执行：
 
 ```bash
-python -m pip install -e '.[test]'
-```
-
-只需要下载一份官方 **encoder** 权重，约 330 MiB：
-
-- 来源：[facebookresearch/dinov2](https://github.com/facebookresearch/dinov2)
-- 文件：[dinov2_vitb14_reg4_pretrain.pth](https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth)
-- 建议存放位置：`/data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth`
-
-在需要运行模型的服务器上手动执行：
-
-```bash
+python -m pip install -e '.[event,test]'
 mkdir -p /data3/hzh/models/dino_world
 curl -fL --retry 3 -C - \
   'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth' \
   -o /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
 ```
 
-在 `configs/predictor.yaml` 和 `configs/detector.yaml` 中直接配置下载文件的路径：
+已有该权重时无需重新下载。模型严格加载本地官方 `dinov2_vitb14_reg4_pretrain.pth`；不自动下载。编码器去掉 CLS/register tokens，使用最后层经 LayerNorm 的 768 维 patch 特征，无 PCA。
 
-```yaml
-model:
-  encoder_checkpoint: /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
-```
+在 `configs/predictor.yaml` 和 `configs/detector.yaml` 设置 `data.root`、`model.encoder_checkpoint`。事件配置继承 RGB predictor 配置。数据需要 DSEC detection 已映射到左事件相机坐标的 `images/left/distorted`、`images/timestamps.txt`、`object_detections/left/tracks.npy`，以及 `events/left/events.h5`。具体坐标与目录约定见 [输入数据](docs/v31.md#输入数据与时间边界)。
 
-构建模型时使用 `weights_only=True` 严格加载官方原始 state_dict，不自动下载、不调用 torch.hub。模型入口支持 PyTorch 新旧序列化格式。
+## 训练与评测
 
-DINO-world predictor 与 768 维检测头均需后续训练生成 checkpoint。旧 DINO-Foresight 权重与当前模型不兼容。
-
-## 后续训练入口
-
-以下是准备好的运行命令；本次代码变更没有启动 DSEC 训练，也没有下载权重。先设置 YAML 的 `data.root` 和 `model.encoder_checkpoint`。正式训练要求 CUDA。
-
-第一阶段训练 predictor：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
-  --stage predictor --config configs/predictor.yaml \
-  --output-dir outputs/dino_world_predictor
-```
-
-默认冻结 encoder；优化 predictor 的所有参数。配置采用 `lr=1e-4`、`weight_decay=0.4`、5000 步线性 warmup 后恒定学习率；DSEC 训练预算默认 40 epochs、无 step 截断，可按实验预算调整。每卡 batch 为 1、梯度累积为 8。保存 `last.ckpt`，并按验证集 next-frame feature loss 保存 `best.ckpt`；该 loss 选出的模型仍需通过检测 AP 评价。
-
-第二阶段固定已训练的 predictor，重新训练检测头：
+1. 先用真实 RGB 的冻结 DINO 特征训练共享检测头：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
   --stage detector --config configs/detector.yaml \
-  --predictor-checkpoint outputs/dino_world_predictor/checkpoints/best.ckpt \
-  --output-dir outputs/dino_world_detector
+  --output-dir outputs/v31_detector
 ```
 
-检测头沿用原 Deformable DETR 架构与检测损失，输入维度改为 768。未提供已训练 predictor 时，检测头训练会直接报错。`data.batch_size` 为每卡 batch，有效 batch = 每卡 batch × GPU 数 × `accumulation_steps`；自动使用所有可见 GPU。
+检测头训练不需要 predictor checkpoint。训练完成后，在 `configs/predictor.yaml` 设置 `model.detector_checkpoint: outputs/v31_detector/checkpoints/best.ckpt`，所有预测器共用该冻结头。
 
-同阶段断点恢复：
+2. 训练完整 Event-RGB 模型 M2：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m foresight.train --stage predictor \
-  --config configs/predictor.yaml \
-  --resume outputs/dino_world_predictor/checkpoints/last.ckpt
+CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
+  --stage predictor --config configs/event_predictor.yaml \
+  --output-dir outputs/v31_m2
 ```
 
-完整 checkpoint 保存 encoder、predictor、检测头（若有）、optimizer、scheduler、训练步数及模型/数据协议。`--resume` 恢复原训练配置，允许数据和 encoder 文件搬迁，要求原 batch、累积、GPU 数与样本选择一致。epoch 中途恢复可能重读该轮开头的样本。DINO-world 使用新的 checkpoint format，旧 DINO-Foresight 训练 checkpoint 会被拒绝。
+将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1，并使用独立输出目录。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
 
-## 推理与评测
-
-推理需要完整的本项目 DINO-world Detector checkpoint；恢复其中的 predictor 后，可用显式 `--predictor-checkpoint` 覆盖。默认配置的 predictor 路径为 `null`，因此完整 Detector checkpoint 不依赖此前 predictor 文件的位置。
+3. 用同一个共享头评测预测器：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.evaluate \
-  --config configs/detector.yaml --split val --data-root /data3/hzh/DSEC \
-  --checkpoint outputs/dino_world_detector/checkpoints/best.ckpt \
-  --output outputs/dino_world_val.json
-
-CUDA_VISIBLE_DEVICES=0 python -m foresight.infer \
-  --checkpoint outputs/dino_world_detector/checkpoints/best.ckpt \
-  --images frame0.png frame1.png frame2.png frame3.png \
-  --output outputs/dino_world_prediction.json
+  --config configs/event_predictor.yaml --split val \
+  --checkpoint outputs/v31_detector/checkpoints/best.ckpt \
+  --predictor-checkpoint outputs/v31_m2/checkpoints/best.ckpt \
+  --event-mode correct --horizon-steps 1 \
+  --output outputs/v31_m2_val.json
 ```
 
-支持原有 `--manifest configs/val600.json`、`--max-samples` 和 `--split test`。指标 JSON 仍使用 0–1 数值，并导出各样本预测。预测框使用原图 `640×480` 坐标，类别和 AP/AR 计算不变。
+评测输出 COCO AP/AR、类别 AP、分区域 latent 指标、样本清单及预测框。AP 使用 0 到 1 的数值，框坐标对应原图 `640×480`。`--event-mode`、多步 rollout、高动态子集和独立图片推理的用法见 [评测与推理](docs/v31.md#评测与推理)。
 
-## 数据检查与开发验证
+## 文件入口
 
-```bash
-python -m pip install -e '.[event]'
-python scripts/check_dsec.py --data-root /path/to/DSEC
-# 仅检查 RGB：
-python scripts/check_dsec.py --data-root /path/to/DSEC --rgb-only
-python -m pytest -q
-```
+- [模型与服务器交接说明](docs/v31.md)：结构、配置、因果边界、恢复与待验证项目。
+- [Event 表征调研](docs/event-representation-survey.md)：相关文献。
+- [上游来源](foresight/vendor/SOURCES.json)、[检测模块许可证](foresight/models/APACHE-LICENSE)：保留的第三方代码来源与许可。
 
-CPU 单元测试检查 3D RoPE、各时间边界的因果性、teacher-forcing loss、冻结 encoder、分块与 activation checkpointing 的输出/梯度、完整训练状态恢复以及原有数据/评测合同。测试使用微型模型和合成数据；真实 encoder 权重加载、CUDA/BF16 与 DSEC AP 仍需在权重和数据就绪后验证。
-
-相关文献见 [Event 表征调研](docs/event-representation-survey.md)。本分支仅保留 DINO-world 模型及其 DSEC 训练、推理和评测路径。来源与许可证见 [SOURCES.json](foresight/vendor/SOURCES.json) 和 [检测模块许可证](foresight/models/APACHE-LICENSE)。权重与 outputs 不提交到 Git。
+权重、数据和 `outputs/` 不提交到 Git。

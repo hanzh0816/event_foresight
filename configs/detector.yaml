@@ -1,31 +1,12 @@
-# Frozen DSEC-trained DINO-world predictor -> newly initialized detection head.
+# Train one shared detection head on real frozen DINO features.
+extends: predictor.yaml
 data:
-  root: /data3/hzh/DSEC
-  image_size: [448, 896]
-  sample_history_frames: 40
-  context_frames: 4
-  frame_interval_s: 0.05 # Fixed by the existing DSEC +50ms protocol.
-  train_stride: 1
-  val_stride: 1
-  test_stride: 1
-  tolerance_us: 1000
-  batch_size: 4 # Per GPU.
-  num_workers: 8
-  persistent_workers: true
-  prefetch_factor: 1
-
+  batch_size: 4
+  num_workers: 4
 model:
-  encoder_checkpoint: /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
-  predictor_checkpoint: null # Supply --predictor-checkpoint when training the head.
-  predictor:
-    hidden_dim: 768
-    depth: 12
-    heads: 12
-    mlp_ratio: 4.0
-    dropout: 0.0
-    query_chunk_size: 1024 # Independent queries; 0 disables chunking.
+  detector_checkpoint: null
 
-detector: # Train a new detection head on the frozen DINO-world features.
+detector:
   hidden_dim: 256
   num_classes: 8
   num_queries: 300
@@ -45,18 +26,4 @@ loss:
   gamma: 2.0
 
 optimization:
-  epochs: 40
-  max_steps: -1
   accumulation_steps: 1
-  lr: 0.0001
-  weight_decay: 0.05
-  scheduler: cosine
-  warmup_fraction: 0.05
-  clip_grad: 1.0
-
-runtime:
-  seed: 42
-  precision: bf16-mixed
-  encoder_chunk_size: 1
-  cpu_threads: 4
-  log_every: 10

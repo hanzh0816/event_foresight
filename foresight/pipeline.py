@@ -1,13 +1,13 @@
-"""DINO World inference assembly, independent of Lightning and annotations."""
+"""Assemble a trained predictor and one shared frozen detection head."""
 
 from contextlib import nullcontext
 
 import torch
 from torch import nn
 
-from .checkpoints import TRAINING_FORMAT, read_checkpoint, load_predictor, input_spec, validate_forecaster
+from .checkpoints import load_predictor, load_shared_detector
 from .models.dino_world import DINOWorldForecaster
-from .models.detector import FutureDetector, postprocess
+from .models.detector import postprocess
 
 
 class ForecastDetector(nn.Module):
@@ -15,41 +15,48 @@ class ForecastDetector(nn.Module):
         super().__init__()
         self.forecaster, self.detector = forecaster, detector
 
-    def forward(self, history_rgb):
-        return self.detector(self.forecaster.forecast(history_rgb))
+    def features(self, history_rgb, history_events=None, *, horizon_steps=1, event_off=False, persistence=False):
+        b, t = history_rgb.shape[:2]
+        history = self.forecaster.encode_latents(history_rgb.flatten(0, 1)).reshape(
+            b, t, -1, self.forecaster.feature_dim)
+        if persistence:
+            return history[:, -1]
+        kwargs = {}
+        if getattr(self.forecaster, "event_encoder", None) is not None:
+            if history_events is None and not event_off:
+                raise ValueError("Event-RGB inference requires history_events")
+            kwargs = dict(event_context=None if event_off else self.forecaster.encode_events(history_events),
+                          event_grid_size=self.forecaster.event_encoder.output_grid, event_off=event_off)
+        elif history_events is not None:
+            raise ValueError("RGB baseline cannot consume events")
+        if horizon_steps == 1:
+            return self.forecaster.predictor(history, **kwargs)
+        return self.forecaster.predictor.rollout(history, horizon_steps, **kwargs)[:, -1]
 
-    def predict(self, history_rgb):
-        return postprocess(self(history_rgb))
+    def forward(self, history_rgb, history_events=None, **kwargs):
+        return self.detector(self.features(history_rgb, history_events, **kwargs))
+
+    def predict(self, history_rgb, history_events=None, **kwargs):
+        return postprocess(self(history_rgb, history_events, **kwargs))
 
 
-def load_pipeline(config, checkpoint=None):
-    """Restore a complete trained World Detector, then apply an explicit P override."""
-    if not checkpoint:
-        raise ValueError("Inference requires --checkpoint with a trained DINO World Detector checkpoint")
-    saved = read_checkpoint(checkpoint)
-    if saved.get("foresight_format") != TRAINING_FORMAT or saved.get("stage") != "detector":
-        raise ValueError("--checkpoint must be a DINO World Detector training checkpoint")
-    architecture = saved.get("detector_architecture")
-    if not isinstance(architecture, dict):
-        raise ValueError("Trained Detector checkpoint lacks its architecture")
+def load_pipeline(config, checkpoint=None, *, persistence=False):
+    """A shared-head checkpoint never supplies random predictor weights for inference."""
     model, data = config["model"], config["data"]
+    checkpoint = checkpoint or model.get("detector_checkpoint")
+    if not checkpoint:
+        raise ValueError("Inference requires a trained shared Detector checkpoint")
+    if not persistence and not model.get("predictor_checkpoint"):
+        raise ValueError("Forecasting requires a trained model.predictor_checkpoint")
     forecaster = DINOWorldForecaster(
         model["encoder_checkpoint"], image_size=data["image_size"],
         history_length=data.get("context_frames", 4), frame_interval_s=data.get("frame_interval_s", 0.05),
         encoder_chunk_size=config["runtime"]["encoder_chunk_size"],
-        predictor_options=model.get("predictor", {}))
-    validate_forecaster(saved, forecaster)
-    if saved.get("input_spec") != input_spec(config, forecaster):
-        raise ValueError("Detector checkpoint and configured RGB data/feature protocol differ")
-    if (architecture.get("feature_dim") != forecaster.feature_dim
-            or tuple(architecture.get("grid_size", ())) != tuple(forecaster.grid_size)
-            or architecture.get("num_classes") != 8):
-        raise ValueError("Detector architecture does not match the DINO World DSEC feature/class contract")
-    pipeline = ForecastDetector(forecaster, FutureDetector(**architecture))
-    pipeline.load_state_dict(saved["state_dict"], strict=True)
-    if model.get("predictor_checkpoint"):
+        predictor_options=model.get("predictor", {}), event_options=model.get("event", {}))
+    detector = load_shared_detector(checkpoint, forecaster)
+    if not persistence:
         load_predictor(forecaster.predictor, model["predictor_checkpoint"], forecaster=forecaster)
-    return pipeline.eval().requires_grad_(False)
+    return ForecastDetector(forecaster, detector).eval().requires_grad_(False)
 
 
 def setup_cuda(config):

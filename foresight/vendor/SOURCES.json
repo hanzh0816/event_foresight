@@ -15,8 +15,17 @@
   "dino_world": {
     "paper": "https://arxiv.org/abs/2507.19468",
     "author_project": "https://baldassarrefe.github.io/publication/dino-world-2025/",
-    "implementation": "Local paper-based implementation; no official predictor code or checkpoint was available in the source audit on 2026-11-26",
+    "implementation": "Local implementation adapted to research-v3.1: 8 layers, dual cross-attention, per-frame spatial attention, 24/24/16 RoPE",
     "encoder_checkpoint": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth",
-    "details": "README.md documents paper requirements, implementation choices and DSEC adaptations"
+    "details": "docs/v31.md records the project architecture and DSEC protocol"
+  },
+  "rvt": {
+    "repository": "https://github.com/uzh-rpg/RVT",
+    "license": "MIT (reference repository); no source copied",
+    "implementation": "Independent RVT-S backbone with project FPN neck",
+    "reference_configuration": [
+      "https://github.com/uzh-rpg/RVT/blob/master/config/model/maxvit_yolox/default.yaml",
+      "https://github.com/uzh-rpg/RVT/blob/master/config/experiment/gen1/small.yaml"
+    ]
   }
 }

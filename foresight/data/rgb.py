@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
-from .definitions import CLASSES, DEFAULT_SPLITS, HEIGHT, WIDTH, require_int
+from .definitions import DEFAULT_SPLITS, HEIGHT, WIDTH, require_int
 from .reader import RGBSequenceReader
 
 
@@ -41,9 +41,17 @@ class RGBDataset:
     """
     def __init__(self, root, split="train", image_size=(448, 896), sample_history_frames=40,
                  context_frames=4, stride=1, tolerance_us=1000, sequences=None,
-                 future_rgb=False, sample_ids=None):
+                 future_rgb=False, sample_ids=None, prediction_frames=1,
+                 horizontal_flip_prob=0.0):
         require_int(sample_history_frames, "sample_history_frames", 1)
         require_int(context_frames, "context_frames", 1)
+        require_int(prediction_frames, "prediction_frames", 1)
+        if prediction_frames > 4:
+            raise ValueError("prediction_frames must be in [1, 4]")
+        if (isinstance(horizontal_flip_prob, bool)
+                or not isinstance(horizontal_flip_prob, (int, float))
+                or not 0 <= horizontal_flip_prob <= 1):
+            raise ValueError("horizontal_flip_prob must be in [0, 1]")
         require_int(stride, "stride", 1)
         require_int(tolerance_us, "tolerance_us", 0)
         if context_frames > sample_history_frames:
@@ -61,7 +69,9 @@ class RGBDataset:
         self.history_frames = self.sample_history_frames = self.window_history_frames = int(sample_history_frames)
         self.context_frames = int(context_frames)
         self.history_ms = self.history_frames * 50
-        self.prediction_ms, self.prediction_frames = 50, 1
+        self.prediction_frames = int(prediction_frames)
+        self.prediction_ms = self.prediction_frames * 50
+        self.horizontal_flip_prob = float(horizontal_flip_prob)
         self.stride, self.tolerance_us = int(stride), int(tolerance_us)
         self.future_rgb = future_rgb
         self.selected_sequences = None if sequences is None else tuple(sequences)
@@ -120,6 +130,9 @@ class RGBDataset:
     def __len__(self):
         return len(self.windows)
 
+    def _image(self, reader, index):
+        return preprocess_rgb(reader.read_image(index).image, self.image_size)
+
     def __getitem__(self, index):
         name, end = self.windows[index]
         start, target_index = end - self.context_frames + 1, end + self.prediction_frames
@@ -129,14 +142,23 @@ class RGBDataset:
         x0, y0, x1, y1 = xyxy.unbind(-1)
         boxes = torch.stack(((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0), dim=-1)
         sample = {
-            "history_rgb": torch.stack([preprocess_rgb(reader.read_image(i).image, self.image_size)
-                                        for i in range(start, end + 1)]),
+            "history_rgb": torch.stack([self._image(reader, i) for i in range(start, end + 1)]),
             "target": {"boxes": boxes, "labels": torch.from_numpy(target.class_ids.copy())},
             "meta": {"sample_id": f"{name}:{end}", "target_id": target.target_id,
-                     "target_timestamp_us": target.timestamp_us},
+                     "target_timestamp_us": target.timestamp_us,
+                     "history_timestamps_us": reader.timestamps[start:end + 1].tolist(),
+                     "input_cutoff_us": int(reader.timestamps[end]),
+                     "prediction_frames": self.prediction_frames},
         }
         if self.future_rgb:
-            sample["future_rgb_target"] = preprocess_rgb(reader.read_image(target_index).image, self.image_size)
+            sample["future_rgb_target"] = self._image(reader, target_index)
+        flipped = self.horizontal_flip_prob > 0 and torch.rand(()).item() < self.horizontal_flip_prob
+        sample["meta"]["horizontal_flipped"] = bool(flipped)
+        if flipped:
+            sample["history_rgb"] = sample["history_rgb"].flip(-1)
+            sample["target"]["boxes"][:, 0] = 1 - sample["target"]["boxes"][:, 0]
+            if self.future_rgb:
+                sample["future_rgb_target"] = sample["future_rgb_target"].flip(-1)
         return sample
 
     def close(self):
@@ -165,4 +187,10 @@ def collate_rgb(samples):
         raise ValueError("Cannot mix forecast and future-target samples in one batch")
     if all(present):
         batch["future_rgb_target"] = torch.stack([sample["future_rgb_target"] for sample in samples])
+    for key in ("history_events", "event_activity"):
+        present = [key in sample for sample in samples]
+        if any(present) and not all(present):
+            raise ValueError(f"Cannot mix samples with and without {key}")
+        if all(present):
+            batch[key] = torch.stack([sample[key] for sample in samples])
     return batch

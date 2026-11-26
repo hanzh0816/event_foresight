@@ -1,40 +1,55 @@
-# DINO-world paper-based predictor, trained from scratch on frozen DINOv2 features.
+# B1: RGB baseline. All model comparisons share this budget and detection head.
 data:
   root: /data3/hzh/DSEC
   image_size: [448, 896]
   sample_history_frames: 40
   context_frames: 4
-  frame_interval_s: 0.05 # Fixed by the existing DSEC +50ms protocol.
+  frame_interval_s: 0.05
   train_stride: 1
   val_stride: 1
+  test_stride: 1
   tolerance_us: 1000
-  batch_size: 1 # Per GPU; global batch = batch_size * visible GPUs * accumulation_steps.
+  horizontal_flip_prob: 0.5
+  batch_size: 1
   num_workers: 4
   persistent_workers: true
   prefetch_factor: 1
 
 model:
   encoder_checkpoint: /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
-  predictor_checkpoint: null # Random predictor initialization; encoder is pretrained.
+  predictor_checkpoint: null
+  rgb_checkpoint: null
+  detector_checkpoint: outputs/v31_detector/checkpoints/best.ckpt
+  event:
+    enabled: false
   predictor:
     hidden_dim: 768
-    depth: 12
+    depth: 8
     heads: 12
     mlp_ratio: 4.0
     dropout: 0.0
-    query_chunk_size: 1024 # Independent queries; 0 disables chunking.
+    drop_path: 0.0
+    query_chunk_size: 512
 
 optimization:
   epochs: 40
-  max_steps: -1 # Full configured epochs; no automatic run is started.
+  max_steps: -1
   accumulation_steps: 8
   lr: 0.0001
-  weight_decay: 0.4
-  scheduler: warmup_constant
-  warmup_steps: 5000 # Paper recipe; adjust deliberately to the DSEC training budget.
+  event_lr: 0.0002
+  finetune_lr: 0.00002
+  fusion_lr: 0.0001
+  finetune_event_lr: 0.0001
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  scheduler: cosine
+  warmup_fraction: 0.05
+  min_lr: 0.000001
   clip_grad: 1.0
   predictor_dropout: true
-  smooth_l1_beta: 0.1
+  smooth_l1_beta: 1.0
+  align_weight: 0.0
+  align_cosine_weight: 0.2
   activation_checkpointing: true
 
 runtime:

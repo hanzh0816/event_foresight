@@ -1,4 +1,4 @@
-"""Train a RGB Predictor or Detector; all visible GPUs are used automatically."""
+"""Train a v3.1 Predictor or shared Detector; all visible GPUs are used automatically."""
 
 import argparse
 from copy import deepcopy
@@ -48,11 +48,17 @@ def make_trainer(config, stage, *, limit_train_batches=1.0, limit_val_batches=1.
     checkpoint_options = dict(dirpath=folder / "checkpoints", save_last=True,
                               enable_version_counter=False, auto_insert_metric_name=False)
     if limit_val_batches:
-        monitor, mode = ("val_AP", "max") if stage == "detector" else ("val_feature_loss", "min")
+        monitor, mode = ("val_AP", "max") if stage == "detector" or config["model"].get("detector_checkpoint") else ("val_feature_loss", "min")
         checkpoint = ModelCheckpoint(filename="best", monitor=monitor, mode=mode,
                                      save_top_k=1, save_on_train_epoch_end=False, **checkpoint_options)
     else:
         checkpoint = ModelCheckpoint(save_top_k=0, save_on_train_epoch_end=True, **checkpoint_options)
+    callbacks = [ValidateAtStepBudget(), checkpoint]
+    if limit_val_batches and stage == "predictor":
+        callbacks.append(ModelCheckpoint(filename="best_foreground", monitor="val_foreground_l1", mode="min",
+                                         save_top_k=1, save_last=False, save_on_train_epoch_end=False,
+                                         dirpath=folder / "checkpoints", auto_insert_metric_name=False,
+                                         enable_version_counter=False))
     return Trainer(
         accelerator="gpu", devices="auto",
         strategy=DDPStrategy(broadcast_buffers=False) if torch.cuda.device_count() > 1 else "auto",
@@ -60,7 +66,7 @@ def make_trainer(config, stage, *, limit_train_batches=1.0, limit_val_batches=1.
         max_epochs=options.get("epochs", 40), max_steps=options.get("max_steps", -1),
         accumulate_grad_batches=options.get("accumulation_steps", 1),
         gradient_clip_val=options.get("clip_grad", 1.0),
-        default_root_dir=folder, callbacks=[ValidateAtStepBudget(), checkpoint],
+        default_root_dir=folder, callbacks=callbacks,
         logger=[CSVLogger(folder, name="logs", version=None),
                 TensorBoardLogger(folder, name="tensorboard", version=None, default_hp_metric=False)],
         limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
@@ -89,6 +95,12 @@ def resume_config(config, checkpoint, stage):
     # locations are taken from today's config; no old checkout is required.
     restored["model"]["encoder_checkpoint"] = config["model"]["encoder_checkpoint"]
     restored["model"]["predictor_checkpoint"] = None
+    restored["model"]["rgb_checkpoint"] = None
+    if config["model"].get("detector_checkpoint"):
+        restored["model"]["detector_checkpoint"] = config["model"]["detector_checkpoint"]
+    restored.pop("resume_detector_checkpoint", None)
+    if stage == "predictor" and saved.get("detector_architecture") is not None:
+        restored["resume_detector_checkpoint"] = str(checkpoint)
     if stage == "detector":
         architecture = saved.get("detector_architecture")
         if not isinstance(architecture, dict):
@@ -139,8 +151,7 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
         torch.set_num_threads(runtime.get("cpu_threads", 4))
         torch.set_float32_matmul_precision("high")
         seed_everything(runtime.get("seed", 42), workers=True)
-        task = (PredictorTask(config) if stage == "predictor" else
-                DetectorTask(config, allow_uninitialized_predictor=bool(resume)))
+        task = PredictorTask(config) if stage == "predictor" else DetectorTask(config)
         trainer = make_trainer(config, stage, limit_train_batches=limit_train_batches,
                                limit_val_batches=limit_val_batches)
         if trainer.is_global_zero:
@@ -174,7 +185,7 @@ def main(argv=None):
     parser.add_argument("--stage", choices=("predictor", "detector"), default="detector")
     parser.add_argument("--config", help="Defaults to configs/<stage>.yaml")
     parser.add_argument("--resume", help="Full same-stage checkpoint; restores optimizer and training recipe")
-    parser.add_argument("--predictor-checkpoint", help="Trained DINO World Predictor initializer; required for a fresh Detector")
+    parser.add_argument("--predictor-checkpoint", help="Initialize predictor training from a matching v3.1 checkpoint")
     parser.add_argument("--output-dir")
     parser.add_argument("--max-steps", type=int, help="Optimizer steps, including steps already completed on resume")
     parser.add_argument("--epochs", type=int)
@@ -183,6 +194,8 @@ def main(argv=None):
     parser.add_argument("--limit-train-batches", type=batch_limit, default=1.0)
     parser.add_argument("--limit-val-batches", type=batch_limit, default=1.0)
     args = parser.parse_args(argv)
+    if args.stage == "detector" and args.predictor_checkpoint:
+        parser.error("The shared detector trains on real DINO features and does not take a predictor initializer")
     if args.resume and args.predictor_checkpoint:
         parser.error("--resume already restores the Predictor; do not combine it with --predictor-checkpoint")
     config = load_config(args.config or f"configs/{args.stage}.yaml")

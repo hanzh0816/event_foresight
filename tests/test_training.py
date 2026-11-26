@@ -114,15 +114,18 @@ def test_predictor_uses_history_only_and_freezes_teacher(tmp_path):
 
 def test_detector_updates_only_head(tmp_path):
     task = DetectorTask(config(tmp_path), forecaster=TinyForecaster(),
-                        detector=nn.Linear(2, 1), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
+                        detector=nn.Linear(2, 1), criterion=TinyCriterion())
     task.train()
     batch = next(iter(DataLoader([sample(1), sample(2)], batch_size=2)))
-    outputs = task(batch["history_rgb"])
+    outputs = task(batch["future_rgb_target"])
     outputs.square().mean().backward()
     assert all(not p.requires_grad and p.grad is None for p in task.forecaster.parameters())
     assert all(p.requires_grad and p.grad is not None for p in task.detector.parameters())
     assert not task.forecaster.training and task.detector.training
     assert all(key.startswith(("forecaster.", "detector.")) for key in task.state_dict())
+    assert torch.equal(task.forecaster.seen[-1], batch["future_rgb_target"])
+    with pytest.raises(ValueError, match="real target RGB"):
+        task(batch["history_rgb"])
 
 
 def test_full_lightning_checkpoint_resumes_optimizer_and_all_weights(tmp_path):
@@ -243,7 +246,7 @@ def test_scratch_detector_architecture_is_saved_and_restored(tmp_path, monkeypat
     cfg["detector"] = {"hidden_dim": 8, "num_classes": 8, "num_queries": 2,
                        "num_levels": 1, "encoder_layers": 1, "decoder_layers": 1,
                        "heads": 2, "points": 1, "mlp_dim": 16, "dropout": 0.1}
-    task = DetectorTask(cfg, forecaster=TinyForecaster(), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
+    task = DetectorTask(cfg, forecaster=TinyForecaster(), criterion=TinyCriterion())
     payload = {"state_dict": task.state_dict()}
     task.on_save_checkpoint(payload)
     architecture = payload["detector_architecture"]
@@ -252,7 +255,7 @@ def test_scratch_detector_architecture_is_saved_and_restored(tmp_path, monkeypat
     monkeypatch.setattr("foresight.checkpoints.read_checkpoint", lambda path: payload)
     restored_config = resume_config(config(tmp_path), "unused.ckpt", "detector")
     assert restored_config["detector"]["hidden_dim"] == 8
-    restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
+    restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion())
     restored.on_load_checkpoint(payload)
     restored.load_state_dict(payload["state_dict"], strict=True)
     assert all(torch.equal(task.state_dict()[key], value) for key, value in restored.state_dict().items())
@@ -266,30 +269,36 @@ def test_teacher_forcing_supervises_every_shifted_frame(tmp_path):
         future = task.forecaster.encode_latents(batch["future_rgb_target"])
         target = torch.cat((history[:, 1:], future[:, None]), dim=1)
         expected = torch.nn.functional.smooth_l1_loss(
-            task.forecaster.predictor.predict_sequence(history), target, beta=0.1)
+            task.forecaster.predictor.predict_sequence(history), target, beta=1.0)
     actual = task.feature_loss(batch)
     torch.testing.assert_close(actual, expected)
     assert task(batch["history_rgb"]).shape == (2, 4, 1, 2)
 
 
-def test_detector_rejects_untrained_predictor(tmp_path):
+def test_shared_detector_never_calls_the_untrained_predictor(tmp_path, monkeypatch):
     cfg = config(tmp_path)
-    with pytest.raises(ValueError, match="requires model.predictor_checkpoint"):
-        DetectorTask(cfg, forecaster=TinyForecaster())
+    forecaster = TinyForecaster()
+    def forbidden_prediction(*args, **kwargs):
+        raise AssertionError("Shared detector training must use real features")
+    monkeypatch.setattr(forecaster.predictor, "forward", forbidden_prediction)
+    task = DetectorTask(cfg, forecaster=forecaster, detector=nn.Linear(2, 1), criterion=TinyCriterion())
+    result = task(torch.randn(2, 3, 2, 2))
+    assert result.shape == (2, 1, 1)
 
 
-def test_warmup_constant_schedule_and_best_predictor_selection(tmp_path, monkeypatch):
+def test_cosine_schedule_uses_five_percent_warmup_and_absolute_minimum(tmp_path, monkeypatch):
     cfg = config(tmp_path)
-    cfg["optimization"].update(scheduler="warmup_constant", warmup_steps=3)
+    cfg["optimization"].update(scheduler="cosine", warmup_fraction=0.05, min_lr=1e-6)
     task = PredictorTask(cfg, forecaster=TinyForecaster())
+    task._trainer = SimpleNamespace(estimated_stepping_batches=100)
     configured = task.configure_optimizers()
     optimizer, scheduler = configured["optimizer"], configured["lr_scheduler"]["scheduler"]
-    rates = []
-    for _ in range(5):
-        rates.append(optimizer.param_groups[0]["lr"])
-        optimizer.step()
-        scheduler.step()
-    assert rates == pytest.approx([1e-3 / 3, 2e-3 / 3, 1e-3, 1e-3, 1e-3])
+    schedule = scheduler.lr_lambdas[0]
+    base_lr = optimizer.param_groups[0]['initial_lr']
+    assert [base_lr * schedule(step) for step in range(5)] == pytest.approx(
+        [2e-4, 4e-4, 6e-4, 8e-4, 1e-3])
+    assert base_lr * schedule(99) == pytest.approx(1e-6)
+    assert schedule(5) > schedule(50) > schedule(98)
     monkeypatch.setattr("foresight.train.Trainer", lambda **kwargs: kwargs)
     trainer = make_trainer(cfg, "predictor")
     callback = next(callback for callback in trainer["callbacks"] if isinstance(callback, ModelCheckpoint))
@@ -297,7 +306,7 @@ def test_warmup_constant_schedule_and_best_predictor_selection(tmp_path, monkeyp
     assert callback.save_last and callback.save_top_k == 1
 
 
-def test_predictor_checkpoint_initializes_frozen_detector_stage(tmp_path):
+def test_predictor_initializer_is_only_used_by_predictor_stage(tmp_path):
     cfg = config(tmp_path)
     predictor_task = PredictorTask(cfg, forecaster=TinyForecaster())
     payload = {"state_dict": deepcopy(predictor_task.state_dict())}
@@ -309,10 +318,11 @@ def test_predictor_checkpoint_initializes_frozen_detector_stage(tmp_path):
     with torch.no_grad():
         for parameter in fresh.predictor.parameters():
             parameter.zero_()
-    detector_task = DetectorTask(cfg, forecaster=fresh, detector=nn.Linear(2, 1), criterion=TinyCriterion())
+    restored = PredictorTask(cfg, forecaster=fresh)
     for name, value in predictor_task.forecaster.state_dict().items():
-        assert torch.equal(detector_task.forecaster.state_dict()[name], value)
-    assert all(not parameter.requires_grad for parameter in detector_task.forecaster.parameters())
+        assert torch.equal(restored.forecaster.state_dict()[name], value)
+    with pytest.raises(ValueError, match="without a predictor initializer"):
+        DetectorTask(cfg, forecaster=fresh, detector=nn.Linear(2, 1), criterion=TinyCriterion())
 
 
 @pytest.mark.parametrize("max_steps,max_epochs,accumulation", [(1, 3, 1), (1, 3, 2), (1, 1, 2), (-1, 1, 2)])
@@ -346,8 +356,85 @@ def test_train_cli_predictor_initializer_is_explicit(tmp_path, monkeypatch):
     monkeypatch.setattr(train, "load_config", lambda path: config(tmp_path))
     monkeypatch.setattr(train, "run", lambda cfg, **kwargs: (cfg, kwargs))
     checkpoint = tmp_path / "predictor.ckpt"
-    cfg, options = train.main(["--stage", "detector", "--predictor-checkpoint", str(checkpoint)])
+    cfg, options = train.main(["--stage", "predictor", "--predictor-checkpoint", str(checkpoint)])
     assert cfg["model"]["predictor_checkpoint"] == str(checkpoint)
-    assert options["stage"] == "detector" and options["resume"] is None
+    assert options["stage"] == "predictor" and options["resume"] is None
     with pytest.raises(SystemExit):
-        train.main(["--resume", "last.ckpt", "--predictor-checkpoint", str(checkpoint)])
+        train.main(["--stage", "predictor", "--resume", "last.ckpt", "--predictor-checkpoint", str(checkpoint)])
+    with pytest.raises(SystemExit):
+        train.main(["--stage", "detector", "--predictor-checkpoint", str(checkpoint)])
+
+
+def test_shared_head_enables_ap_selection_and_separate_foreground_checkpoint(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    cfg['model']['detector_checkpoint'] = str(tmp_path / 'shared-head.ckpt')
+    monkeypatch.setattr('foresight.train.Trainer', lambda **kwargs: kwargs)
+    trainer = make_trainer(cfg, 'predictor')
+    checkpoints = [callback for callback in trainer['callbacks'] if isinstance(callback, ModelCheckpoint)]
+    ap = next(callback for callback in checkpoints if callback.monitor == 'val_AP')
+    foreground = next(callback for callback in checkpoints if callback.monitor == 'val_foreground_l1')
+    assert ap.mode == 'max' and ap.save_last and ap.save_top_k == 1
+    assert foreground.mode == 'min' and foreground.save_top_k == 1
+
+
+def test_predictor_resume_restores_embedded_head_without_external_checkpoint(tmp_path, monkeypatch):
+    from foresight.models.detector import FutureDetector
+
+    source = PredictorTask(config(tmp_path), forecaster=TinyForecaster())
+    source.detector = FutureDetector(feature_dim=2, grid_size=(1, 1), hidden_dim=8,
+                                     num_classes=8, num_queries=2, num_levels=1,
+                                     encoder_layers=1, decoder_layers=1, heads=2,
+                                     points=1, mlp_dim=16, dropout=0.0).eval().requires_grad_(False)
+    source.config['model']['detector_checkpoint'] = str(tmp_path / 'missing-original-head.ckpt')
+    payload = {'state_dict': deepcopy(source.state_dict())}
+    source.on_save_checkpoint(payload)
+    assert payload['detector_architecture'] == source.detector.architecture
+    checkpoint = tmp_path / 'predictor-full.ckpt'
+    torch.save(payload, checkpoint)
+    restored_config = resume_config(config(tmp_path), checkpoint, 'predictor')
+    assert restored_config['resume_detector_checkpoint'] == str(checkpoint)
+    assert restored_config['model']['detector_checkpoint'] == str(tmp_path / 'missing-original-head.ckpt')
+
+    def external_head_forbidden(*args, **kwargs):
+        raise AssertionError('Full resume must use its embedded validation head')
+
+    monkeypatch.setattr('foresight.checkpoints.load_shared_detector', external_head_forbidden)
+    restored = PredictorTask(restored_config, forecaster=TinyForecaster())
+    restored.on_load_checkpoint(payload)
+    restored.load_state_dict(payload['state_dict'], strict=True)
+    restored.train()
+    assert not restored.detector.training
+    assert all(not parameter.requires_grad for parameter in restored.detector.parameters())
+    for name, value in source.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+    incompatible = deepcopy(payload)
+    incompatible['detector_architecture']['num_queries'] += 1
+    with pytest.raises(ValueError, match='validation head'):
+        restored.on_load_checkpoint(incompatible)
+
+
+@pytest.mark.parametrize('stage', ['predictor', 'detector'])
+@pytest.mark.parametrize('split', ['train', 'val'])
+def test_training_loaders_always_use_one_step_targets(tmp_path, monkeypatch, stage, split):
+    cfg = config(tmp_path)
+    # A rollout evaluation setting must not change teacher-forcing labels.
+    cfg['data']['prediction_frames'] = 4
+    cfg['evaluation'] = {'horizon_steps': 4}
+    if stage == 'predictor':
+        task = PredictorTask(cfg, forecaster=TinyForecaster())
+    else:
+        task = DetectorTask(cfg, forecaster=TinyForecaster(), detector=nn.Linear(2, 1),
+                            criterion=TinyCriterion())
+    task._trainer = SimpleNamespace(world_size=1, global_rank=0)
+    observed = []
+    examples = [sample(1), sample(2)]
+
+    def dataset_factory(configuration, requested_split, **kwargs):
+        observed.append((requested_split, kwargs))
+        return examples
+
+    monkeypatch.setattr('foresight.data.dataset_from_config', dataset_factory)
+    loader = task._loader(split)
+    assert loader.dataset is examples
+    assert observed == [(split, {'future_rgb': True, 'prediction_frames': 1})]
+    assert task.config['data']['prediction_frames'] == 4

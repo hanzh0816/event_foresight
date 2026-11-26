@@ -1,4 +1,4 @@
-"""Small CPU contracts for the independently implemented DINO-world model."""
+"""CPU contracts for the v3.1 RGB/Event predictor and frozen DINO encoder."""
 
 from copy import deepcopy
 import math
@@ -37,25 +37,27 @@ def assert_parameter_gradients_match(left, right):
         torch.testing.assert_close(right_value.grad, left_value.grad, rtol=2e-5, atol=2e-7)
 
 
-def test_rope_matches_paper_three_axis_rotation_and_preserves_last_four_dimensions():
+def test_rope_rotates_time_16_y_24_x_24_and_spatial_attention_leaves_time_channels():
     torch.manual_seed(7)
     value = torch.randn(2, 3, 6, 64, requires_grad=True)
     coordinates = torch.tensor([[0., 0., 0.], [.05, 0., 1.], [.1, 0., 2.],
                                 [.2, 1., 0.], [.4, 1., 1.], [.8, 1., 2.]])
     actual = apply_rope_3d(value, coordinates)
-    frequencies = 2 * math.pi / 10 ** torch.linspace(-2, 2, 10)
     expected = value.clone()
-    for axis in range(3):
+    start = 0
+    for axis, width in enumerate((16, 24, 24)):
+        frequencies = 2 * math.pi / 10 ** torch.linspace(-2, 2, width // 2)
         angle = coordinates[:, axis, None] * frequencies[None, :]
-        start = axis * 20
-        even, odd = value[..., start:start + 20:2], value[..., start + 1:start + 20:2]
-        expected[..., start:start + 20:2] = even * angle.cos() - odd * angle.sin()
-        expected[..., start + 1:start + 20:2] = even * angle.sin() + odd * angle.cos()
-    # FP32 logspace and exponentiating linspace round differently before the
-    # highest-frequency rotations; the independent formulas agree to 1e-4.
-    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(actual[..., 60:], value[..., 60:], rtol=0, atol=0)
+        even, odd = value[..., start:start + width:2], value[..., start + 1:start + width:2]
+        expected[..., start:start + width:2] = even * angle.cos() - odd * angle.sin()
+        expected[..., start + 1:start + width:2] = even * angle.sin() + odd * angle.cos()
+        start += width
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(actual.square().sum(-1), value.square().sum(-1))
+    spatial_coordinates = coordinates.clone()
+    spatial_coordinates[:, 0] = 0
+    spatial = apply_rope_3d(value, spatial_coordinates)
+    torch.testing.assert_close(spatial[..., :16], value[..., :16], rtol=0, atol=0)
     actual.square().mean().backward()
     assert value.grad is not None and torch.isfinite(value.grad).all()
 
@@ -168,7 +170,7 @@ def test_query_chunking_matches_outputs_and_all_gradients(activation_checkpointi
 @pytest.mark.parametrize('query_chunk_size', [0, 1, 5])
 def test_attention_projects_context_once_per_layer_independent_of_query_chunks(query_chunk_size):
     predictor = small_predictor(query_chunk_size=query_chunk_size).eval()
-    counts = {block.kv: 0 for block in predictor.blocks}
+    counts = {block.rgb_attention.kv: 0 for block in predictor.blocks}
 
     def record_projection(module, inputs, output):
         counts[module] += 1
@@ -184,7 +186,7 @@ def test_attention_projects_context_once_per_layer_independent_of_query_chunks(q
 
 
 @pytest.mark.parametrize('options', [dict(hidden_dim=32), dict(hidden_dim=64, heads=2)])
-def test_predictor_requires_paper_64_dimensional_attention_heads(options):
+def test_predictor_requires_64_dimensional_attention_heads(options):
     with pytest.raises(ValueError):
         small_predictor(**options)
 
@@ -243,9 +245,9 @@ def test_forecaster_strictly_loads_frozen_last_layer_tokens_without_pca(tmp_path
     assert model.predictor.training and not model.encoder.training
     assert all(not parameter.requires_grad for parameter in model.encoder.parameters())
     assert all(parameter.requires_grad for parameter in model.predictor.parameters())
-    assert model.feature_dim == model.latent_dim == 768
+    assert model.feature_dim == 768
     images = torch.randn(3, 3, 28, 42, requires_grad=True)
-    tokens = model.encode_dense(images)
+    tokens = model.encode_latents(images)
     expected = (images.mean((1, 2, 3))[:, None, None] + torch.arange(6)[None, :, None]
                 + state['scale'][None, None, :])
     torch.testing.assert_close(tokens, expected)
@@ -282,3 +284,241 @@ def test_encoder_checkpoint_rejects_incompatible_or_corrupt_weights(tmp_path, mo
     torch.save(state, path)
     with pytest.raises((ValueError, RuntimeError)):
         tiny_forecaster(path)
+
+
+def test_v31_defaults_and_optional_event_layer_selection():
+    assert dino_world.PREDICTOR_DEFAULTS['depth'] == 8
+    assert dino_world.PREDICTOR_DEFAULTS['hidden_dim'] == 768
+    assert dino_world.PREDICTOR_DEFAULTS['heads'] == 12
+    predictor = small_predictor(event_enabled=True, depth=4, event_layers=[2, 4])
+    assert [b.event_attention is not None for b in predictor.blocks] == [False, True, False, True]
+    assert predictor.architecture['event_layers'] == [2, 4]
+    assert isinstance(predictor.context_proj[-1], nn.LayerNorm)
+    assert all(block.rgb_attention.query_norm is not block.rgb_attention.context_norm
+               for block in predictor.blocks)
+    with pytest.raises(ValueError, match='event_layers'):
+        small_predictor(event_enabled=True, event_layers=[0])
+
+
+@pytest.mark.parametrize('target_index', [0, 1, 2])
+def test_parallel_predictions_exclude_future_rgb_and_event_values_and_gradients(target_index):
+    torch.manual_seed(61)
+    predictor = small_predictor(event_enabled=True).eval()
+    history = torch.randn(2, 4, 6, 12, requires_grad=True)
+    events = torch.randn(2, 4, 6, 12, requires_grad=True)
+    original = predictor.predict_sequence(history, event_context=events)
+    for modality in ('rgb', 'event'):
+        altered_history, altered_events = history.detach().clone(), events.detach().clone()
+        altered = altered_history if modality == 'rgb' else altered_events
+        altered[:, target_index + 1:] = 30 * torch.randn_like(altered[:, target_index + 1:])
+        changed = predictor.predict_sequence(altered_history, event_context=altered_events)
+        torch.testing.assert_close(changed[:, target_index], original[:, target_index], rtol=0, atol=0)
+        assert not torch.allclose(changed[:, -1], original[:, -1])
+    original[:, target_index].square().mean().backward()
+    for value in (history, events):
+        assert value.grad[:, :target_index + 1].abs().sum() > 0
+        assert torch.count_nonzero(value.grad[:, target_index + 1:]) == 0
+    # A nonzero gate also reaches the event branch on the very first backward.
+    for block in predictor.blocks:
+        assert block.gamma.grad.abs() > 0
+        assert block.event_attention.kv.weight.grad.abs().sum() > 0
+
+
+def test_event_mask_uses_observation_cutoff_even_when_event_precedes_target_time():
+    torch.manual_seed(67)
+    predictor = small_predictor(event_enabled=True).eval()
+    history = torch.randn(1, 2, 6, 12)
+    events = torch.randn(1, 2, 6, 12, requires_grad=True)
+    kwargs = dict(context_times=torch.tensor([0., .05], dtype=torch.float64),
+                  query_times=torch.tensor([.05, .1], dtype=torch.float64),
+                  event_times=torch.tensor([0., .025], dtype=torch.float64))
+    predicted = predictor.predict_at(history, event_context=events, **kwargs)
+    changed = events.detach().clone()
+    changed[:, 1] = 30 * torch.randn_like(changed[:, 1])
+    altered = predictor.predict_at(history, event_context=changed, **kwargs)
+    torch.testing.assert_close(predicted[:, 0], altered[:, 0], rtol=0, atol=0)
+    assert not torch.allclose(predicted[:, 1], altered[:, 1])
+    predicted[:, 0].square().mean().backward()
+    assert events.grad[:, 0].abs().sum() > 0
+    assert torch.count_nonzero(events.grad[:, 1]) == 0
+
+
+def test_explicit_cutoff_masks_rgb_and_event_independently_of_future_horizon():
+    torch.manual_seed(71)
+    predictor = small_predictor(event_enabled=True).eval()
+    rgb, events = torch.randn(1, 4, 6, 12), torch.randn(1, 4, 6, 12)
+    times = torch.tensor([0., .05, .10, .15], dtype=torch.float64)
+    kwargs = dict(context_times=times, query_times=times.new_tensor([.2, .3]),
+                  observation_times=times.new_tensor([.05, .05]), event_times=times)
+    before = predictor.predict_at(rgb, event_context=events, **kwargs)
+    rgb[:, 2:] += 50 * torch.randn_like(rgb[:, 2:])
+    events[:, 2:] += 50 * torch.randn_like(events[:, 2:])
+    after = predictor.predict_at(rgb, event_context=events, **kwargs)
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
+    assert not torch.allclose(before[:, 0], before[:, 1])
+
+
+def test_gamma_zero_and_off_exactly_reproduce_shared_rgb_baseline():
+    torch.manual_seed(73)
+    rgb = small_predictor().eval()
+    event = small_predictor(event_enabled=True, gate_init=0).eval()
+    missing, unexpected = event.load_state_dict(rgb.state_dict(), strict=False)
+    assert not unexpected
+    assert all('event_' in name or 'gamma' in name for name in missing)
+    history, events = torch.randn(2, 4, 6, 12), torch.randn(2, 4, 6, 12)
+    expected = rgb.predict_sequence(history)
+    actual = event.predict_sequence(history, event_context=events)
+    off = event.predict_sequence(history, event_off=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(off, expected, rtol=0, atol=0)
+    actual.square().mean().backward()
+    assert any(block.gamma.grad.abs() > 0 for block in event.blocks)
+    assert all(torch.count_nonzero(block.event_attention.kv.weight.grad) == 0
+               for block in event.blocks)
+
+
+@pytest.mark.parametrize('activation_checkpointing', [False, True])
+def test_event_chunking_and_checkpointing_preserve_outputs_and_parameter_gradients(activation_checkpointing):
+    torch.manual_seed(79)
+    whole = small_predictor(event_enabled=True).train()
+    chunked = deepcopy(whole)
+    chunked.activation_checkpointing = activation_checkpointing
+    chunked.query_chunk_size = 5
+    history = torch.randn(2, 4, 6, 12, requires_grad=True)
+    events = torch.randn(2, 4, 6, 12, requires_grad=True)
+    other_history = history.detach().clone().requires_grad_(True)
+    other_events = events.detach().clone().requires_grad_(True)
+    expected = whole.predict_sequence(history, event_context=events)
+    actual = chunked.predict_sequence(other_history, event_context=other_events)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-7)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(other_history.grad, history.grad, rtol=2e-5, atol=2e-7)
+    torch.testing.assert_close(other_events.grad, events.grad, rtol=2e-5, atol=2e-7)
+    assert_parameter_gradients_match(whole, chunked)
+
+
+def test_spatial_attention_mixes_patches_but_isolates_each_target_frame():
+    torch.manual_seed(83)
+    predictor = small_predictor().eval()
+    attention = predictor.blocks[0].spatial_attention
+    coordinates = predictor._coordinates(torch.zeros(1))
+    queries = torch.randn(2, 12, 64, requires_grad=True)
+    original = attention(queries, coordinates, 5)
+    changed = queries.detach().clone()
+    changed[:, 7] += 20 * torch.randn_like(changed[:, 7])
+    altered = attention(changed, coordinates, 5)
+    torch.testing.assert_close(original[:, :6], altered[:, :6], rtol=0, atol=0)
+    assert not torch.allclose(original[:, 6], altered[:, 6])
+    original[:, 0].square().sum().backward()
+    assert queries.grad[:, 1:6].abs().sum() > 0
+    assert torch.count_nonzero(queries.grad[:, 6:]) == 0
+
+
+def test_parallel_targets_equal_individually_predicted_targets():
+    torch.manual_seed(89)
+    predictor = small_predictor(event_enabled=True).eval()
+    history, events = torch.randn(2, 4, 6, 12), torch.randn(2, 4, 6, 12)
+    original = predictor.predict_sequence(history, event_context=events)
+    times = predictor._default_times(history)
+    for index in range(4):
+        query = times[index:index + 1] + .05
+        individual = predictor(history[:, :index + 1], context_times=times[:index + 1],
+                               query_times=query, event_context=events[:, :index + 1])
+        torch.testing.assert_close(individual, original[:, index], rtol=1e-5, atol=2e-6)
+
+
+def test_event_rollout_keeps_initial_events_and_absolute_times_fixed():
+    torch.manual_seed(97)
+    predictor = small_predictor(event_enabled=True).eval()
+    history = torch.randn(2, 4, 6, 12, requires_grad=True)
+    events = torch.randn(2, 4, 6, 12, requires_grad=True)
+    original_times = predictor._default_times(history)
+    actual = predictor.rollout(history, 3, event_context=events)
+    context, times, expected = history, original_times, []
+    for _ in range(3):
+        target = times[-1:] + .05
+        prediction = predictor(context, context_times=times, query_times=target,
+                               event_context=events, event_times=original_times)
+        expected.append(prediction)
+        context = torch.cat((context[:, 1:], prediction[:, None]), dim=1)
+        times = torch.cat((times[1:], target))
+    torch.testing.assert_close(actual, torch.stack(expected, dim=1), rtol=0, atol=0)
+    actual[:, -1].square().mean().backward()
+    assert history.grad.abs().sum() > 0 and events.grad.abs().sum() > 0
+    with pytest.raises(ValueError, match='initial observation cutoff'):
+        predictor.rollout(history, 3, event_context=events, event_times=original_times + .05)
+
+
+def test_compact_event_grid_uses_rgb_coordinate_system_and_receives_gradients():
+    predictor = small_predictor(grid_size=(4, 6), event_enabled=True).eval()
+    rgb = torch.randn(1, 4, 24, 12)
+    events = torch.randn(1, 4, 6, 12, requires_grad=True)
+    coordinates = predictor._coordinates(torch.zeros(1), grid_size=(2, 3))
+    torch.testing.assert_close(coordinates[:, 1], torch.tensor([.5, .5, .5, 2.5, 2.5, 2.5]))
+    torch.testing.assert_close(coordinates[:, 2], torch.tensor([.5, 2.5, 4.5, .5, 2.5, 4.5]))
+    result = predictor.predict_sequence(rgb, event_context=events, event_grid_size=(2, 3))
+    assert result.shape == (1, 4, 24, 12)
+    result.square().mean().backward()
+    assert events.grad.abs().sum() > 0
+
+
+def test_no_available_events_has_zero_contribution_including_projection_bias():
+    predictor = small_predictor(event_enabled=True).eval()
+    rgb, events = torch.randn(1, 1, 6, 12), torch.randn(1, 1, 6, 12)
+    original = predictor(rgb, event_off=True)
+    # Event ends after the RGB observation cutoff but before target time.
+    actual = predictor(rgb, event_context=events, event_times=torch.tensor([.025]))
+    torch.testing.assert_close(actual, original, rtol=0, atol=0)
+
+
+def test_event_checkpointing_preserves_bfloat16_outputs_and_gradients():
+    torch.manual_seed(101)
+    plain = small_predictor(event_enabled=True).train()
+    recompute = deepcopy(plain)
+    recompute.activation_checkpointing = True
+    history, events = torch.randn(1, 4, 6, 12), torch.randn(1, 4, 6, 12)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        expected = plain.predict_sequence(history, event_context=events)
+        actual = recompute.predict_sequence(history, event_context=events)
+    assert expected.dtype == actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    assert_parameter_gradients_match(plain, recompute)
+
+
+class TinyGridBackbone(TinyBackbone):
+    def get_intermediate_layers(self, images, n, reshape):
+        spatial = (images.shape[-2] // 14) * (images.shape[-1] // 14)
+        offsets = torch.arange(spatial, device=images.device, dtype=images.dtype)
+        return ((images.mean((1, 2, 3))[:, None, None]
+                 + offsets[None, :, None] + self.scale[None, None, :]),)
+
+
+def test_forecaster_integrates_rvt_and_only_freezes_rgb_encoder(tmp_path, monkeypatch):
+    monkeypatch.setattr(dino_world, 'vit_base', TinyGridBackbone)
+    path = tmp_path / 'encoder.pth'
+    torch.save(TinyGridBackbone().state_dict(), path)
+    model = DINOWorldForecaster(
+        path, image_size=(28, 56), history_length=2,
+        predictor_options=dict(hidden_dim=64, heads=1, depth=2, mlp_ratio=2., query_chunk_size=0),
+        event_options=dict(enabled=True, in_channels=2, input_size=(32, 64),
+                           channels=(4, 8, 16, 32), heads=(1, 1, 1, 1),
+                           num_blocks=(1, 1, 1, 1), fpn_channels=8, partition_size=(2, 2))).train()
+    rgb = torch.randn(2, 2, 3, 28, 56, requires_grad=True)
+    events = torch.rand(2, 2, 2, 32, 64, requires_grad=True)
+    output = model(rgb, events)
+    assert output.shape == (2, 8, 768)
+    assert model.architecture['model'] == 'dino-world-v31'
+    assert model.architecture['event_encoder']['channels'] == (4, 8, 16, 32)
+    assert model.event_encoder.training and not model.encoder.training
+    output.square().mean().backward()
+    assert rgb.grad is None
+    assert events.grad.abs().sum() > 0
+    assert all(p.grad is None for p in model.encoder.parameters())
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.event_encoder.parameters())
+    with torch.no_grad():
+        off = model(rgb, event_off=True)
+        encoded = model.encode_latents(rgb.flatten(0, 1)).reshape(2, 2, 8, 768)
+        torch.testing.assert_close(off, model.predictor(encoded, event_off=True))

@@ -48,12 +48,45 @@ def test_config_paths_are_project_relative(tmp_path, monkeypatch):
     assert config["runtime"]["encoder_chunk_size"] == 1
 
 
-@pytest.mark.parametrize("key", ["detector_checkpoint", "dinof_checkpoint", "unknown_option"])
+@pytest.mark.parametrize("key", ["dinof_checkpoint", "unknown_option"])
 def test_config_rejects_unsupported_model_options(tmp_path, key):
     config = {"model": {"encoder_checkpoint": "unused.pth", key: None}}
     path = tmp_path / "unsupported.yaml"
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match=key):
+        load_config(path)
+
+
+def test_config_accepts_separate_shared_head_and_predictor_paths(tmp_path):
+    config = {"model": {"encoder_checkpoint": "encoder.pth", "predictor_checkpoint": "predictor.ckpt",
+                        "detector_checkpoint": "head.ckpt"}}
+    path = tmp_path / "shared-head.yaml"
+    path.write_text(json.dumps(config))
+    loaded = load_config(path)
+    for key in ("encoder_checkpoint", "predictor_checkpoint", "detector_checkpoint"):
+        assert Path(loaded["model"][key]) == ROOT / config["model"][key]
+
+
+def test_event_config_derives_channels_alignment_and_zero_gate_initializer(tmp_path):
+    config = {"model": {"encoder_checkpoint": "encoder.pth", "rgb_checkpoint": "rgb.ckpt",
+                        "event": {"enabled": True}}, "data": {"event_bins": 5}}
+    path = tmp_path / "event.yaml"
+    path.write_text(json.dumps(config))
+    loaded = load_config(path)
+    assert loaded["model"]["event"]["in_channels"] == 10
+    assert loaded["model"]["event"]["input_size"] == [512, 1024]
+    assert loaded["model"]["predictor"]["gate_init"] == 0.0
+
+
+@pytest.mark.parametrize("override,message", [
+    ({"in_channels": 10}, "2 \\* event_bins"),
+    ({"input_size": [256, 512]}, "stride-16 grid"),
+])
+def test_event_config_rejects_voxel_or_spatial_contract_mismatch(tmp_path, override, message):
+    config = {"model": {"encoder_checkpoint": "encoder.pth", "event": dict(enabled=True, **override)}}
+    path = tmp_path / "bad-event.yaml"
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match=message):
         load_config(path)
 
 

@@ -1,0 +1,4 @@
+# M1: same Event-RGB model and prediction loss without alignment supervision.
+extends: event_predictor.yaml
+optimization:
+  align_weight: 0.0
