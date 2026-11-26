@@ -17,8 +17,6 @@ from torch.utils.checkpoint import checkpoint
 from ..vendor.dinov2.models.vision_transformer import vit_base
 
 
-ENCODER_FILENAME = "dinov2_vitb14_reg4_pretrain.pth"
-ENCODER_URL = ("https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/" + ENCODER_FILENAME)
 BACKBONE = dict(img_size=518, patch_size=14, init_values=1.0, ffn_layer="mlp",
                 block_chunks=0, num_register_tokens=4,
                 interpolate_antialias=True, interpolate_offset=0.0)

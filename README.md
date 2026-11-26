@@ -43,16 +43,22 @@ mkdir -p /data3/hzh/models/dino_world
 curl -fL --retry 3 -C - \
   'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth' \
   -o /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
-python scripts/link_checkpoints.py --root /data3/hzh/models/dino_world
 ```
 
-脚本将项目内 `checkpoints` 链接至该目录；不会覆盖已有目录或其他软链接。如果已有 `checkpoints`，直接将 YAML 中的 `model.encoder_checkpoint` 设置为下载文件的绝对路径。构建模型时使用 `weights_only=True` 严格加载官方原始 state_dict，不自动下载、不调用 torch.hub。模型入口支持 PyTorch 新旧序列化格式。
+在 `configs/predictor.yaml` 和 `configs/detector.yaml` 中直接配置下载文件的路径：
+
+```yaml
+model:
+  encoder_checkpoint: /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
+```
+
+构建模型时使用 `weights_only=True` 严格加载官方原始 state_dict，不自动下载、不调用 torch.hub。模型入口支持 PyTorch 新旧序列化格式。
 
 DINO-world predictor 与 768 维检测头均需后续训练生成 checkpoint。旧 DINO-Foresight 权重与当前模型不兼容。
 
 ## 后续训练入口
 
-以下是准备好的运行命令；本次代码变更没有启动 DSEC 训练，也没有下载权重。先修改 YAML 的 `data.root`。正式训练要求 CUDA。
+以下是准备好的运行命令；本次代码变更没有启动 DSEC 训练，也没有下载权重。先设置 YAML 的 `data.root` 和 `model.encoder_checkpoint`。正式训练要求 CUDA。
 
 第一阶段训练 predictor：
 

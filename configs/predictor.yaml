@@ -14,7 +14,7 @@ data:
   prefetch_factor: 1
 
 model:
-  encoder_checkpoint: checkpoints/dinov2_vitb14_reg4_pretrain.pth
+  encoder_checkpoint: /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
   predictor_checkpoint: null # Random predictor initialization; encoder is pretrained.
   predictor:
     hidden_dim: 768
