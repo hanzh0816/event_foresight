@@ -1,4 +1,4 @@
-"""Check the full DSEC inventory needed by RGB/Event train, eval and test (CPU only)."""
+"""Check DSEC inventory and event coverage using v3.1 RGB-timestamp windows."""
 
 import argparse
 import json
@@ -63,7 +63,8 @@ def check_images(reader, windows, deep, errors):
             errors.append(f"Cannot decode {path}: {exc}")
 
 
-def check_events(path, reader, windows, *, deep, event_window_us):
+def check_events(path, reader, windows, *, deep, event_window_us,
+                 event_endpoint="rgb_timestamp"):
     from foresight.data.event_reader import EventStream, H5HandleCache
 
     cache = H5HandleCache(max_open=1)
@@ -94,14 +95,21 @@ def check_events(path, reader, windows, *, deep, event_window_us):
         # Check coverage and causality for EVERY usable window, without loading event payloads.
         ends = np.array([end for _, end in windows], dtype=np.int64)
         history = ends[:, None] + np.arange(-3, 1)
-        stops = reader.exposures[history, 1]
+        if event_endpoint == "rgb_timestamp":
+            stops = reader.timestamps[history]
+        elif event_endpoint == "exposure_end":
+            require(reader.exposures is not None,
+                    f"{path}: exposure_end checks require images/left/exposure_timestamps.txt")
+            stops = reader.exposures[history, 1]
+        else:
+            raise ValueError("event_endpoint must be rgb_timestamp or exposure_end")
         invalid = np.any((stops - event_window_us < first) | (stops > last), axis=1)
         require(not invalid.any(),
                 f"{path}: event coverage insufficient for {int(invalid.sum())} windows "
-                f"(window_us={event_window_us}, available=[{first}, {last}])")
-        require(np.all(stops <= stops[:, -1:]), f"{path}: historical exposure exceeds input cutoff")
+                f"(window_us={event_window_us}, endpoint={event_endpoint}, available=[{first}, {last}])")
+        require(np.all(stops <= stops[:, -1:]), f"{path}: historical event endpoint exceeds input cutoff")
         require(np.all(reader.timestamps[ends + 1] > stops[:, -1]),
-                f"{path}: future target must follow the input exposure cutoff")
+                f"{path}: future target must follow the {event_endpoint} input cutoff")
 
         # Read compressed payloads; --deep scans all chunks with bounded memory.
         chunk = 1_000_000 if deep else 4096
@@ -145,12 +153,15 @@ def check_events(path, reader, windows, *, deep, event_window_us):
         cache.close()
 
 
-def check_sequence(root, split, name, *, rgb_only, deep, event_window_us):
+def check_sequence(root, split, name, *, rgb_only, deep, event_window_us,
+                   event_endpoint="rgb_timestamp"):
     path = root / ("test" if split == "test" else "train") / name
     result = dict(name=name, path=str(path), frames=0, windows=0, events=0, errors=[])
     required = ["images/timestamps.txt", "object_detections/left/tracks.npy"]
     if not rgb_only:
-        required += ["images/left/exposure_timestamps.txt", "events/left/events.h5"]
+        required.append("events/left/events.h5")
+        if event_endpoint == "exposure_end":
+            required.append("images/left/exposure_timestamps.txt")
     for relative in required:
         file = path / relative
         try:
@@ -172,22 +183,28 @@ def check_sequence(root, split, name, *, rgb_only, deep, event_window_us):
             require(bool(windows), "No usable labeled 40-frame-history/next-frame windows")
             if not rgb_only:
                 result["events"] = check_events(path / "events/left/events.h5", reader, windows,
-                                                deep=deep, event_window_us=event_window_us)
+                                                deep=deep, event_window_us=event_window_us,
+                                                event_endpoint=event_endpoint)
     except Exception as exc:
         result["errors"].append(f"{type(exc).__name__}: {exc}")
     return result
 
 
-def check_dsec(root, *, rgb_only=False, deep=False, event_window_us=50000):
+def check_dsec(root, *, rgb_only=False, deep=False, event_window_us=50000,
+               event_endpoint="rgb_timestamp"):
     require(event_window_us in (50000, 200000), "event_window_us must be 50000 or 200000")
+    require(event_endpoint in ("rgb_timestamp", "exposure_end"),
+            "event_endpoint must be rgb_timestamp or exposure_end")
     root = Path(root).expanduser().resolve()
     report = dict(root=str(root), mode="rgb" if rgb_only else "rgb+event", deep=deep,
-                  event_window_us=event_window_us, splits={})
+                  event_window_us=event_window_us, event_endpoint=event_endpoint,
+                  v31_event_protocol=not rgb_only and event_window_us == 50000 and event_endpoint == "rgb_timestamp",
+                  splits={})
     for split, names in DEFAULT_SPLITS.items():
         rows = []
         for name in names:
             row = check_sequence(root, split, name, rgb_only=rgb_only, deep=deep,
-                                 event_window_us=event_window_us)
+                                 event_window_us=event_window_us, event_endpoint=event_endpoint)
             rows.append(row)
             print(f"[{'FAIL' if row['errors'] else 'OK'}] {split}/{name}: "
                   f"frames={row['frames']} windows={row['windows']}", flush=True)
@@ -208,8 +225,11 @@ def check_dsec(root, *, rgb_only=False, deep=False, event_window_us=50000):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--data-root", required=True, help="DSEC root containing train/ and test/")
-    parser.add_argument("--rgb-only", action="store_true", help="Do not require event streams or exposure files")
-    parser.add_argument("--event-window-us", type=int, choices=(50000, 200000), default=50000)
+    parser.add_argument("--rgb-only", action="store_true", help="Do not require event streams; validate exposure metadata only if present")
+    parser.add_argument("--event-window-us", type=int, choices=(50000, 200000), default=50000,
+                        help="50000 for v3.1; 200000 is a separate legacy coverage check")
+    parser.add_argument("--event-endpoint", choices=("rgb_timestamp", "exposure_end"), default="rgb_timestamp",
+                        help="v3.1 uses RGB timestamps; exposure_end checks the legacy exposure-based protocol")
     parser.add_argument("--deep", action="store_true", help="Decode all PNGs and scan all event chunks (slow)")
     parser.add_argument("--output", help="Optional JSON report path outside DSEC (overwrites an existing report)")
     args = parser.parse_args(argv)
@@ -217,7 +237,8 @@ def main(argv=None):
     root = Path(args.data_root).expanduser().resolve()
     if output and output.is_relative_to(root):
         parser.error("--output must be outside the DSEC root")
-    report = check_dsec(root, rgb_only=args.rgb_only, deep=args.deep, event_window_us=args.event_window_us)
+    report = check_dsec(root, rgb_only=args.rgb_only, deep=args.deep, event_window_us=args.event_window_us,
+                        event_endpoint=args.event_endpoint)
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w") as handle:
