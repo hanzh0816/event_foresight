@@ -1,9 +1,10 @@
-# Default baseline: official frozen DINO-Foresight -> trainable RGB detector.
+# Frozen DSEC-trained DINO-world predictor -> newly initialized detection head.
 data:
   root: /data3/hzh/DSEC
   image_size: [448, 896]
   sample_history_frames: 40
   context_frames: 4
+  frame_interval_s: 0.05 # Fixed by the existing DSEC +50ms protocol.
   train_stride: 1
   val_stride: 1
   test_stride: 1
@@ -14,9 +15,16 @@ data:
   prefetch_factor: 1
 
 model:
-  dinof_checkpoint: checkpoints/dinof.pt
-  detector_checkpoint: checkpoints/detector.pt # Initializes existing RGB H with a fresh optimizer.
-  predictor_checkpoint: null # Null keeps official P0; set an adapted P checkpoint to replace it.
+  encoder_checkpoint: checkpoints/dinov2_vitb14_reg4_pretrain.pth
+  detector_checkpoint: null # Old DINO-Foresight detector assets are incompatible.
+  predictor_checkpoint: null # Supply --predictor-checkpoint when training the head.
+  predictor:
+    hidden_dim: 768
+    depth: 12
+    heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+    query_chunk_size: 1024 # Independent queries; 0 disables chunking.
 
 detector: # Used when model.detector_checkpoint is null (train a new head from scratch).
   hidden_dim: 256

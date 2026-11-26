@@ -1,9 +1,10 @@
-# Optional RGB-only DSEC adaptation. No detector is needed for this stage.
+# DINO-world paper-based predictor, trained from scratch on frozen DINOv2 features.
 data:
   root: /data3/hzh/DSEC
   image_size: [448, 896]
   sample_history_frames: 40
   context_frames: 4
+  frame_interval_s: 0.05 # Fixed by the existing DSEC +50ms protocol.
   train_stride: 1
   val_stride: 1
   tolerance_us: 1000
@@ -13,20 +14,28 @@ data:
   prefetch_factor: 1
 
 model:
-  dinof_checkpoint: checkpoints/dinof.pt
-  detector_checkpoint: null
-  predictor_checkpoint: null # Optional initialization from a new-project training checkpoint.
+  encoder_checkpoint: checkpoints/dinov2_vitb14_reg4_pretrain.pth
+  detector_checkpoint: null # Old DINO-Foresight detector assets are incompatible.
+  predictor_checkpoint: null # Random predictor initialization; encoder is pretrained.
+  predictor:
+    hidden_dim: 768
+    depth: 12
+    heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+    query_chunk_size: 1024 # Independent queries; 0 disables chunking.
 
 optimization:
   epochs: 40
-  max_steps: 500 # Optional adaptation budget, not a convergence claim.
+  max_steps: -1 # Full configured epochs; no automatic run is started.
   accumulation_steps: 8
-  lr: 0.00001
-  weight_decay: 0.01
-  scheduler: constant
-  warmup_fraction: 0.0
+  lr: 0.0001
+  weight_decay: 0.4
+  scheduler: warmup_constant
+  warmup_steps: 5000 # Paper recipe; adjust deliberately to the DSEC training budget.
   clip_grad: 1.0
-  predictor_dropout: false
+  predictor_dropout: true
+  smooth_l1_beta: 0.1
   activation_checkpointing: true
 
 runtime:

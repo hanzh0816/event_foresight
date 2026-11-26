@@ -19,5 +19,12 @@
     "repository": "https://github.com/fundamentalvision/Deformable-DETR",
     "license": "Apache-2.0",
     "implementation": "Existing pure-PyTorch Deformable DETR baseline; parameter names and forward preserved"
+  },
+  "dino_world": {
+    "paper": "https://arxiv.org/abs/2507.19468",
+    "author_project": "https://baldassarrefe.github.io/publication/dino-world-2025/",
+    "implementation": "Local paper-based implementation; no official predictor code or checkpoint was available in the source audit on 2026-11-26",
+    "encoder_checkpoint": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth",
+    "details": "README.md documents paper requirements, implementation choices and DSEC adaptations"
   }
 }

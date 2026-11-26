@@ -1,4 +1,6 @@
-"""One-time CPU conversion of trusted source weights, with tensor-exact audit.
+"""Legacy DINO-Foresight conversion; NOT used by the DINO-world baseline.
+
+One-time CPU conversion of trusted source weights, with tensor-exact audit.
 
 Run from the installed project as ``python -m scripts.import_weights``. Source
 Lightning files are only accepted here; normal inference loads weights_only

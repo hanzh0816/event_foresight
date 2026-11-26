@@ -1,4 +1,4 @@
-"""Connect this checkout to the shared model-only checkpoint directory."""
+"""Link manually downloaded DINO-world encoder assets; never downloads files."""
 
 import argparse
 from pathlib import Path
@@ -6,10 +6,10 @@ from pathlib import Path
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default="/data3/hzh/models/event_foresight")
+    parser.add_argument("--root", default="/data3/hzh/models/dino_world")
     args = parser.parse_args(argv)
     source = Path(args.root).expanduser().resolve()
-    for filename in ("dinof.pt", "detector.pt", "assets.json"):
+    for filename in ("dinov2_vitb14_reg4_pretrain.pth",):
         if not (source / filename).is_file():
             raise FileNotFoundError(f"Missing shared asset: {source / filename}")
     target = Path(__file__).resolve().parents[1] / "checkpoints"

@@ -13,8 +13,9 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 
 from .samplers import ValidationSampler
+from .checkpoints import TRAINING_FORMAT, input_spec, validate_forecaster
 
-CHECKPOINT_FORMAT = "event-foresight-training-v1"
+CHECKPOINT_FORMAT = TRAINING_FORMAT
 
 
 def _distributed():
@@ -31,10 +32,14 @@ class _RGBTask(LightningModule):
         self.config = deepcopy(config)
         self.save_hyperparameters({"config": self.config})
         if forecaster is None:
-            from .models.forecaster import DINOForecaster
-            forecaster = DINOForecaster(
-                config["model"]["dinof_checkpoint"],
-                encoder_chunk_size=config.get("runtime", {}).get("encoder_chunk_size", 1))
+            from .models.dino_world import DINOWorldForecaster
+            data = config["data"]
+            forecaster = DINOWorldForecaster(
+                config["model"]["encoder_checkpoint"], image_size=data["image_size"],
+                history_length=data.get("context_frames", 4),
+                frame_interval_s=data.get("frame_interval_s", 0.05),
+                encoder_chunk_size=config.get("runtime", {}).get("encoder_chunk_size", 1),
+                predictor_options=config["model"].get("predictor", {}))
         self.forecaster = forecaster
         predictor_checkpoint = config["model"].get("predictor_checkpoint")
         if predictor_checkpoint:
@@ -44,19 +49,7 @@ class _RGBTask(LightningModule):
         self.accumulated_examples = 0
         self.last_report = None
         self.last_validation_step = None
-        data = config["data"]
-        image_size = tuple(data["image_size"])
-        if hasattr(forecaster, "image_size") and tuple(forecaster.image_size) != image_size:
-            raise ValueError("Dataset image_size differs from the loaded DINO-Foresight model")
-        self.input_spec = {
-            "image_size": list(image_size),
-            "context_frames": data.get("context_frames", 4),
-            "sample_history_frames": data.get("sample_history_frames", 40),
-            "tolerance_us": data.get("tolerance_us", 1000),
-            "prediction_ms": 50,
-            "preprocessing": "pil-bilinear-imagenet-mean-std",
-            "feature_space": "dinov2-multilayer-fixed-pca",
-        }
+        self.input_spec = input_spec(config, forecaster)
 
     def _loader(self, split):
         from .data import RGBDataset, collate_rgb
@@ -136,6 +129,14 @@ class _RGBTask(LightningModule):
         schedule = options.get("scheduler", "constant" if self.stage == "predictor" else "cosine")
         if schedule == "constant":
             return optimizer
+        if schedule == "warmup_constant":
+            warmup = options.get("warmup_steps", 5000)
+            if type(warmup) is not int or warmup < 0:
+                raise ValueError("warmup_steps must be a nonnegative integer")
+            def warmup_factor(step):
+                return min(1.0, (step + 1) / max(1, warmup))
+            return {"optimizer": optimizer, "lr_scheduler": {
+                "scheduler": torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor), "interval": "step"}}
         if schedule != "cosine":
             raise ValueError(f"Unknown learning-rate scheduler: {schedule}")
         total = self.trainer.estimated_stepping_batches
@@ -165,18 +166,20 @@ class _RGBTask(LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         # The complete model state is intentional: resume never silently
-        # substitutes a different frozen encoder, PCA or predictor.
+        # substitutes a different frozen encoder or predictor.
         checkpoint["foresight_format"] = CHECKPOINT_FORMAT
         checkpoint["stage"] = self.stage
         checkpoint["config"] = deepcopy(self.config)
         checkpoint["input_spec"] = deepcopy(self.input_spec)
         checkpoint["training_spec"] = self._training_spec()
+        checkpoint["forecaster_architecture"] = deepcopy(self.forecaster.architecture)
 
     def on_load_checkpoint(self, checkpoint):
         if checkpoint.get("foresight_format") != CHECKPOINT_FORMAT:
             raise ValueError("--resume requires a full event-foresight training checkpoint")
         if checkpoint.get("stage") != self.stage:
             raise ValueError("Cannot resume a checkpoint from a different training stage")
+        validate_forecaster(checkpoint, self.forecaster)
         if checkpoint.get("input_spec") != self.input_spec:
             raise ValueError("Training checkpoint and configured RGB data/feature protocol differ")
         if checkpoint.get("training_spec") != self._training_spec():
@@ -184,7 +187,7 @@ class _RGBTask(LightningModule):
 
 
 class PredictorTask(_RGBTask):
-    """Frozen RGB encoder/PCA, trainable predictor, true future RGB targets."""
+    """Frozen encoder and causal next-frame teacher forcing across every history step."""
 
     stage = "predictor"
 
@@ -193,7 +196,10 @@ class PredictorTask(_RGBTask):
         self.forecaster.requires_grad_(False)
         self.forecaster.predictor.requires_grad_(True)
         options = config["optimization"]
-        self.predictor_dropout = options.get("predictor_dropout", False)
+        self.predictor_dropout = options.get("predictor_dropout", True)
+        self.smooth_l1_beta = options.get("smooth_l1_beta", 0.1)
+        if not math.isfinite(self.smooth_l1_beta) or self.smooth_l1_beta <= 0:
+            raise ValueError("smooth_l1_beta must be finite and positive")
         if hasattr(self.forecaster.predictor, "activation_checkpointing"):
             self.forecaster.predictor.activation_checkpointing = options.get("activation_checkpointing", True)
         self.train()
@@ -202,25 +208,29 @@ class PredictorTask(_RGBTask):
     def train(self, mode=True):
         super().train(mode)
         self.forecaster.encoder.eval()
-        self.forecaster.pca.eval()
         self.forecaster.predictor.train(mode and self.predictor_dropout)
         return self
 
-    def forward(self, history_rgb):
+    def _encode_history(self, history_rgb):
         batch, frames = history_rgb.shape[:2]
         with torch.no_grad():
             history = self.forecaster.encode_latents(history_rgb.flatten(0, 1))
-        return self.forecaster.predictor(history.reshape(batch, frames, *history.shape[1:]))
+        return history.reshape(batch, frames, *history.shape[1:])
+
+    def forward(self, history_rgb):
+        return self.forecaster.predictor.predict_sequence(self._encode_history(history_rgb))
 
     def feature_loss(self, batch):
         if "future_rgb_target" not in batch:
             raise ValueError("Predictor training requires a separate future_rgb_target")
-        prediction = self(batch["history_rgb"])
+        history = self._encode_history(batch["history_rgb"])
+        prediction = self.forecaster.predictor.predict_sequence(history)
         with torch.no_grad():
-            target = self.forecaster.encode_latents(batch["future_rgb_target"])
+            future = self.forecaster.encode_latents(batch["future_rgb_target"])
+            target = torch.cat((history[:, 1:], future[:, None]), dim=1)
         if prediction.shape != target.shape:
-            raise ValueError("Predicted and teacher future latent shapes differ")
-        return F.smooth_l1_loss(prediction.float(), target.float())
+            raise ValueError("Predicted and teacher next-frame latent shapes differ")
+        return F.smooth_l1_loss(prediction.float(), target.float(), beta=self.smooth_l1_beta)
 
     def training_step(self, batch, batch_idx):
         loss = self.feature_loss(batch)
@@ -251,8 +261,10 @@ class PredictorTask(_RGBTask):
         loss = total / count
         self.log("val_feature_loss", loss, prog_bar=True, sync_dist=False)
         self.log("val_samples", count, sync_dist=False)
-        self.last_report = {"metrics": {"future_smooth_l1": loss},
-                            "metadata": {"num_samples": int(count), "stage": self.stage}}
+        self.last_report = {"metrics": {"next_frame_smooth_l1": loss},
+                            "metadata": {"num_samples": int(count), "stage": self.stage,
+                                         "supervision": "all_shifted_next_frames",
+                                         "smooth_l1_beta": self.smooth_l1_beta}}
         self._write_report()
         self.last_validation_step = int(self.global_step)
 
@@ -264,28 +276,28 @@ class PredictorTask(_RGBTask):
 
 
 class DetectorTask(_RGBTask):
-    """Train a detection head on frozen RGB DINO-Foresight predicted features."""
+    """Train a fresh detection head on a trained, frozen DINO World predictor."""
 
     stage = "detector"
 
-    def __init__(self, config, *, forecaster=None, detector=None, criterion=None):
+    def __init__(self, config, *, forecaster=None, detector=None, criterion=None,
+                 allow_uninitialized_predictor=False):
+        if config["model"].get("detector_checkpoint"):
+            raise ValueError("Use --resume for a DINO World Detector; imported DINO-Foresight heads are incompatible")
+        if not config["model"].get("predictor_checkpoint") and not allow_uninitialized_predictor:
+            raise ValueError("Detector training requires model.predictor_checkpoint from trained DINO World, or --resume")
         super().__init__(config, forecaster=forecaster)
         self.forecaster.requires_grad_(False).eval()
         architecture = deepcopy(getattr(detector, "architecture", None))
         if detector is None:
-            from .models.detector import FutureDetector, load_detector
-            checkpoint = config["model"].get("detector_checkpoint")
-            if checkpoint:
-                detector = load_detector(checkpoint)
-                architecture = deepcopy(detector.architecture)
-            else:
-                architecture = {name: parameter.default for name, parameter in
-                                inspect.signature(FutureDetector.__init__).parameters.items()
-                                if name != "self" and parameter.default is not inspect.Parameter.empty}
-                architecture.update(config.get("detector", {}))
-                architecture.update(feature_dim=self.forecaster.feature_dim,
-                                    grid_size=list(self.forecaster.grid_size))
-                detector = FutureDetector(**architecture)
+            from .models.detector import FutureDetector
+            architecture = {name: parameter.default for name, parameter in
+                            inspect.signature(FutureDetector.__init__).parameters.items()
+                            if name != "self" and parameter.default is not inspect.Parameter.empty}
+            architecture.update(config.get("detector", {}))
+            architecture.update(feature_dim=self.forecaster.feature_dim,
+                                grid_size=list(self.forecaster.grid_size))
+            detector = FutureDetector(**architecture)
         self.detector_architecture = architecture
         self.detector = detector.requires_grad_(True)
         if criterion is None:
@@ -356,7 +368,7 @@ class DetectorTask(_RGBTask):
             evaluator = FutureDetectionEvaluator(self.datasets["val"], sample_ids=[p["sample_id"] for p in predictions])
             evaluator.update(predictions)
             report = evaluator.compute().to_dict()
-            report["metadata"].update(stage=self.stage, feature_source="frozen_dino_foresight_prediction",
+            report["metadata"].update(stage=self.stage, feature_source="frozen_dino_world_prediction",
                                       input_spec=self.input_spec)
             if self.config.get("output_dir"):
                 path = Path(self.config["output_dir"]) / "metrics_val.json"

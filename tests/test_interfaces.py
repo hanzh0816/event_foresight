@@ -30,7 +30,7 @@ assert 'lightning' not in sys.modules
 import foresight.evaluate
 import foresight.train
 from foresight.config import load_config
-assert load_config('configs/detector.yaml')['model']['dinof_checkpoint'].endswith('dinof.pt')
+assert load_config('configs/detector.yaml')['model']['encoder_checkpoint'].endswith('dinov2_vitb14_reg4_pretrain.pth')
 '''
     env = dict(os.environ, PYTHONPATH=str(ROOT), CUDA_VISIBLE_DEVICES="")
     result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path,
@@ -41,7 +41,7 @@ assert load_config('configs/detector.yaml')['model']['dinof_checkpoint'].endswit
 def test_config_paths_are_project_relative(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = load_config("configs/detector.yaml")
-    assert Path(config["model"]["dinof_checkpoint"]).is_absolute()
+    assert Path(config["model"]["encoder_checkpoint"]).is_absolute()
     assert config["data"]["image_size"] == [448, 896]
     assert config["runtime"]["encoder_chunk_size"] == 1
 
@@ -58,19 +58,20 @@ def test_manifest_preserves_order_and_rejects_duplicates(tmp_path):
 def test_predictor_load_preserves_frozen_coordinate_contract(tmp_path):
     holder = nn.Module()
     holder.encoder = nn.Linear(2, 2)
-    holder.pca = nn.Linear(2, 1)
+    holder.architecture = {"name": "tiny-world"}
     holder.predictor = nn.Linear(1, 1)
     state = {f"forecaster.{key}": value.clone() for key, value in holder.state_dict().items()}
     state['forecaster.predictor.bias'] = state['forecaster.predictor.bias'] + 1
-    saved = dict(foresight_format=TRAINING_FORMAT, stage="predictor", state_dict=state)
+    saved = dict(foresight_format=TRAINING_FORMAT, stage="predictor", state_dict=state,
+                 forecaster_architecture=deepcopy(holder.architecture))
     path = tmp_path / "predictor.ckpt"
     torch.save(saved, path)
     expected = state['forecaster.predictor.bias']
     load_predictor(holder.predictor, path, forecaster=holder)
     assert torch.equal(holder.predictor.bias, expected)
     before = deepcopy(holder.predictor.state_dict())
-    state['forecaster.pca.weight'] = state['forecaster.pca.weight'] + 1
+    state['forecaster.encoder.weight'] = state['forecaster.encoder.weight'] + 1
     torch.save(saved, path)
-    with pytest.raises(ValueError, match="different frozen pca"):
+    with pytest.raises(ValueError, match="different frozen encoder"):
         load_predictor(holder.predictor, path, forecaster=holder)
     assert all(torch.equal(before[k], v) for k, v in holder.predictor.state_dict().items())

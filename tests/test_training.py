@@ -8,10 +8,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 from foresight.training import CHECKPOINT_FORMAT, DetectorTask, PredictorTask
 from foresight.samplers import ValidationSampler
-from foresight.train import batch_limit, make_trainer, resume_config
+from foresight.train import batch_limit, make_trainer, resume_config, ValidateAtStepBudget
 
 
 class TinyPredictor(nn.Module):
@@ -21,30 +22,35 @@ class TinyPredictor(nn.Module):
         self.dropout = nn.Dropout(0.5)
         self.activation_checkpointing = False
 
+    def predict_sequence(self, history):
+        return self.proj(self.dropout(history))
+
     def forward(self, history):
-        return self.proj(self.dropout(history.mean(1)))
+        return self.predict_sequence(history)[:, -1]
 
 
 class TinyForecaster(nn.Module):
     image_size = (2, 2)
-    feature_dim = 4
+    feature_dim = 2
     grid_size = (1, 1)
+    history_length = 4
+    feature_space = "tiny-last-layer"
+    architecture = {"name": "tiny-world", "history_length": 4, "frame_interval_s": 0.05}
 
     def __init__(self):
         super().__init__()
-        self.encoder = nn.Sequential(nn.Linear(3, 4), nn.Dropout(0.5))
-        self.pca = nn.Linear(4, 2, bias=False)
+        self.encoder = nn.Sequential(nn.Linear(3, 2), nn.Dropout(0.5))
         self.predictor = TinyPredictor()
         self.seen = []
 
     def encode_latents(self, rgb):
         self.seen.append(rgb.detach().clone())
-        return self.pca(self.encoder(rgb.mean((-1, -2))))[:, None]
+        return self.encoder(rgb.mean((-1, -2)))[:, None]
 
     def forecast(self, history):
         b, t = history.shape[:2]
         encoded = self.encode_latents(history.flatten(0, 1)).reshape(b, t, 1, 2)
-        return self.predictor(encoded) @ self.pca.weight
+        return self.predictor(encoded)
 
 
 class TinyCriterion(nn.Module):
@@ -58,7 +64,7 @@ def config(tmp_path):
     return {
         "data": {"root": str(tmp_path), "image_size": [2, 2], "context_frames": 4,
                  "sample_history_frames": 40, "batch_size": 2, "num_workers": 0},
-        "model": {"dinof_checkpoint": "unused.pt", "predictor_checkpoint": None,
+        "model": {"encoder_checkpoint": "unused.pt", "predictor_checkpoint": None,
                   "detector_checkpoint": None},
         "optimization": {"epochs": 3, "max_steps": 2, "accumulation_steps": 1,
                          "lr": 1e-3, "weight_decay": 0.0, "scheduler": "constant",
@@ -96,9 +102,8 @@ def test_predictor_uses_history_only_and_freezes_teacher(tmp_path):
     loss.backward()
     assert loss.dtype == torch.float32
     assert all(p.grad is None and not p.requires_grad for p in forecaster.encoder.parameters())
-    assert all(p.grad is None and not p.requires_grad for p in forecaster.pca.parameters())
     assert all(p.grad is not None and p.requires_grad for p in forecaster.predictor.parameters())
-    assert not forecaster.encoder.training and not forecaster.pca.training
+    assert not forecaster.encoder.training
     assert not forecaster.predictor.training
     assert torch.equal(forecaster.seen[-1], batch["future_rgb_target"])
     modified = dict(batch, future_rgb_target=batch["future_rgb_target"] + 20)
@@ -110,7 +115,7 @@ def test_predictor_uses_history_only_and_freezes_teacher(tmp_path):
 
 def test_detector_updates_only_head(tmp_path):
     task = DetectorTask(config(tmp_path), forecaster=TinyForecaster(),
-                        detector=nn.Linear(4, 1), criterion=TinyCriterion())
+                        detector=nn.Linear(2, 1), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
     task.train()
     batch = next(iter(DataLoader([sample(1), sample(2)], batch_size=2)))
     outputs = task(batch["history_rgb"])
@@ -156,6 +161,7 @@ def test_checkpoint_rejects_stage_protocol_and_batch_changes(tmp_path):
     task.on_load_checkpoint(payload)
     for field, bad_value, match in (
         ("stage", "detector", "different training stage"),
+        ("forecaster_architecture", {}, "architecture"),
         ("input_spec", {}, "protocol"),
         ("training_spec", {}, "batch"),
     ):
@@ -222,7 +228,7 @@ def test_resume_recipe_preserves_budget_and_selection(monkeypatch, tmp_path):
         "foresight_format": CHECKPOINT_FORMAT, "stage": "predictor", "config": saved_config})
     current = config(tmp_path)
     current["data"]["root"] = "/new/data"
-    current["model"]["dinof_checkpoint"] = "/new/dinof.pt"
+    current["model"]["encoder_checkpoint"] = "/new/dinov2.pth"
     result = resume_config(current, "unused.ckpt", "predictor")
     assert result["optimization"]["lr"] == 2e-5
     assert result["data"]["train_sample_ids"] == ["a", "b"]
@@ -238,17 +244,115 @@ def test_scratch_detector_architecture_is_saved_and_restored(tmp_path, monkeypat
     cfg["detector"] = {"hidden_dim": 8, "num_classes": 8, "num_queries": 2,
                        "num_levels": 1, "encoder_layers": 1, "decoder_layers": 1,
                        "heads": 2, "points": 1, "mlp_dim": 16, "dropout": 0.1}
-    task = DetectorTask(cfg, forecaster=TinyForecaster(), criterion=TinyCriterion())
+    task = DetectorTask(cfg, forecaster=TinyForecaster(), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
     payload = {"state_dict": task.state_dict()}
     task.on_save_checkpoint(payload)
     architecture = payload["detector_architecture"]
-    assert architecture["feature_dim"] == 4 and architecture["grid_size"] == [1, 1]
+    assert architecture["feature_dim"] == 2 and architecture["grid_size"] == [1, 1]
     assert architecture["hidden_dim"] == 8
     monkeypatch.setattr("foresight.checkpoints.read_checkpoint", lambda path: payload)
     restored_config = resume_config(config(tmp_path), "unused.ckpt", "detector")
     assert restored_config["model"]["detector_checkpoint"] is None
     assert restored_config["detector"]["hidden_dim"] == 8
-    restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion())
+    restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion(), allow_uninitialized_predictor=True)
     restored.on_load_checkpoint(payload)
     restored.load_state_dict(payload["state_dict"], strict=True)
     assert all(torch.equal(task.state_dict()[key], value) for key, value in restored.state_dict().items())
+
+
+def test_teacher_forcing_supervises_every_shifted_frame(tmp_path):
+    task = PredictorTask(config(tmp_path), forecaster=TinyForecaster())
+    batch = next(iter(DataLoader([sample(1), sample(2)], batch_size=2)))
+    with torch.no_grad():
+        history = task._encode_history(batch["history_rgb"])
+        future = task.forecaster.encode_latents(batch["future_rgb_target"])
+        target = torch.cat((history[:, 1:], future[:, None]), dim=1)
+        expected = torch.nn.functional.smooth_l1_loss(
+            task.forecaster.predictor.predict_sequence(history), target, beta=0.1)
+    actual = task.feature_loss(batch)
+    torch.testing.assert_close(actual, expected)
+    assert task(batch["history_rgb"]).shape == (2, 4, 1, 2)
+
+
+def test_detector_rejects_untrained_predictor_and_old_head(tmp_path):
+    cfg = config(tmp_path)
+    with pytest.raises(ValueError, match="requires model.predictor_checkpoint"):
+        DetectorTask(cfg, forecaster=TinyForecaster())
+    cfg["model"]["detector_checkpoint"] = "old_dinof_detector.pt"
+    with pytest.raises(ValueError, match="incompatible"):
+        DetectorTask(cfg, forecaster=TinyForecaster(), allow_uninitialized_predictor=True)
+
+
+def test_warmup_constant_schedule_and_best_predictor_selection(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    cfg["optimization"].update(scheduler="warmup_constant", warmup_steps=3)
+    task = PredictorTask(cfg, forecaster=TinyForecaster())
+    configured = task.configure_optimizers()
+    optimizer, scheduler = configured["optimizer"], configured["lr_scheduler"]["scheduler"]
+    rates = []
+    for _ in range(5):
+        rates.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+    assert rates == pytest.approx([1e-3 / 3, 2e-3 / 3, 1e-3, 1e-3, 1e-3])
+    monkeypatch.setattr("foresight.train.Trainer", lambda **kwargs: kwargs)
+    trainer = make_trainer(cfg, "predictor")
+    callback = next(callback for callback in trainer["callbacks"] if isinstance(callback, ModelCheckpoint))
+    assert callback.monitor == "val_feature_loss" and callback.mode == "min"
+    assert callback.save_last and callback.save_top_k == 1
+
+
+def test_predictor_checkpoint_initializes_frozen_detector_stage(tmp_path):
+    cfg = config(tmp_path)
+    predictor_task = PredictorTask(cfg, forecaster=TinyForecaster())
+    payload = {"state_dict": deepcopy(predictor_task.state_dict())}
+    predictor_task.on_save_checkpoint(payload)
+    checkpoint = tmp_path / "predictor.ckpt"
+    torch.save(payload, checkpoint)
+    cfg["model"]["predictor_checkpoint"] = str(checkpoint)
+    fresh = deepcopy(predictor_task.forecaster)
+    with torch.no_grad():
+        for parameter in fresh.predictor.parameters():
+            parameter.zero_()
+    detector_task = DetectorTask(cfg, forecaster=fresh, detector=nn.Linear(2, 1), criterion=TinyCriterion())
+    for name, value in predictor_task.forecaster.state_dict().items():
+        assert torch.equal(detector_task.forecaster.state_dict()[name], value)
+    assert all(not parameter.requires_grad for parameter in detector_task.forecaster.parameters())
+
+
+@pytest.mark.parametrize("max_steps,max_epochs,accumulation", [(1, 3, 1), (1, 3, 2), (1, 1, 2), (-1, 1, 2)])
+def test_budget_validates_and_saves_best_and_last(tmp_path, max_steps, max_epochs, accumulation):
+
+    class TinyValidatedTask(TinyPredictorTask):
+        def val_dataloader(self):
+            return DataLoader([sample(6), sample(7)], batch_size=2)
+
+    cfg = config(tmp_path)
+    cfg["optimization"].update(max_steps=max_steps, epochs=max_epochs, accumulation_steps=accumulation)
+    task = TinyValidatedTask(cfg, forecaster=TinyForecaster())
+    best = ModelCheckpoint(dirpath=tmp_path / "checkpoints", filename="best", monitor="val_feature_loss",
+                           mode="min", save_top_k=1, save_last=True, save_on_train_epoch_end=False)
+    trainer = Trainer(accelerator="cpu", devices=1, max_steps=max_steps, max_epochs=max_epochs,
+                      accumulate_grad_batches=accumulation,
+                      callbacks=[ValidateAtStepBudget(), best], logger=False,
+                      enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0)
+    trainer.fit(task)
+    expected_steps = 1 if max_steps == 1 else 2
+    assert task.last_validation_step == trainer.global_step == expected_steps
+    assert best.best_model_path.endswith("best.ckpt") and torch.isfinite(best.best_model_score)
+    for filename in ("best.ckpt", "last.ckpt"):
+        saved = torch.load(tmp_path / "checkpoints" / filename, map_location="cpu", weights_only=False)
+        assert saved["global_step"] == expected_steps
+        assert all(torch.equal(task.state_dict()[key], value) for key, value in saved["state_dict"].items())
+
+
+def test_train_cli_predictor_initializer_is_explicit(tmp_path, monkeypatch):
+    from foresight import train
+    monkeypatch.setattr(train, "load_config", lambda path: config(tmp_path))
+    monkeypatch.setattr(train, "run", lambda cfg, **kwargs: (cfg, kwargs))
+    checkpoint = tmp_path / "predictor.ckpt"
+    cfg, options = train.main(["--stage", "detector", "--predictor-checkpoint", str(checkpoint)])
+    assert cfg["model"]["predictor_checkpoint"] == str(checkpoint)
+    assert options["stage"] == "detector" and options["resume"] is None
+    with pytest.raises(SystemExit):
+        train.main(["--resume", "last.ckpt", "--predictor-checkpoint", str(checkpoint)])

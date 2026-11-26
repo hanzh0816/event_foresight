@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from lightning.pytorch import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 import torch
@@ -32,17 +32,26 @@ def batch_limit(value):
     raise argparse.ArgumentTypeError("Use an integer batch count or a fraction between 0 and 1")
 
 
+class ValidateAtStepBudget(Callback):
+    """Request the normal fit-loop validation when a step budget ends mid-epoch."""
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.max_steps > 0 and trainer.global_step >= trainer.max_steps:
+            # Lightning validates on an explicit stop request before leaving fit,
+            # so ModelCheckpoint sees the final metric and saves best/last there.
+            trainer.should_stop = True
+
+
 def make_trainer(config, stage, *, limit_train_batches=1.0, limit_val_batches=1.0):
     options, runtime = config["optimization"], config["runtime"]
     folder = Path(config["output_dir"])
     checkpoint_options = dict(dirpath=folder / "checkpoints", save_last=True,
                               enable_version_counter=False, auto_insert_metric_name=False)
-    if stage == "detector" and limit_val_batches:
-        checkpoint = ModelCheckpoint(filename="best", monitor="val_AP", mode="max",
+    if limit_val_batches:
+        monitor, mode = ("val_AP", "max") if stage == "detector" else ("val_feature_loss", "min")
+        checkpoint = ModelCheckpoint(filename="best", monitor=monitor, mode=mode,
                                      save_top_k=1, save_on_train_epoch_end=False, **checkpoint_options)
     else:
-        # Predictor adaptation is defined by its configured budget; preserve the
-        # final model without selecting a checkpoint by validation feature loss.
         checkpoint = ModelCheckpoint(save_top_k=0, save_on_train_epoch_end=True, **checkpoint_options)
     return Trainer(
         accelerator="gpu", devices="auto",
@@ -51,7 +60,7 @@ def make_trainer(config, stage, *, limit_train_batches=1.0, limit_val_batches=1.
         max_epochs=options.get("epochs", 40), max_steps=options.get("max_steps", -1),
         accumulate_grad_batches=options.get("accumulation_steps", 1),
         gradient_clip_val=options.get("clip_grad", 1.0),
-        default_root_dir=folder, callbacks=[checkpoint],
+        default_root_dir=folder, callbacks=[ValidateAtStepBudget(), checkpoint],
         logger=[CSVLogger(folder, name="logs", version=None),
                 TensorBoardLogger(folder, name="tensorboard", version=None, default_hp_metric=False)],
         limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
@@ -78,7 +87,7 @@ def resume_config(config, checkpoint, stage):
             restored["runtime"][key] = config["runtime"][key]
     # Full resume will restore all parameter values. Only the initial asset
     # locations are taken from today's config; no old checkout is required.
-    restored["model"]["dinof_checkpoint"] = config["model"]["dinof_checkpoint"]
+    restored["model"]["encoder_checkpoint"] = config["model"]["encoder_checkpoint"]
     restored["model"]["detector_checkpoint"] = None
     restored["model"]["predictor_checkpoint"] = None
     if stage == "detector":
@@ -131,7 +140,8 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
         torch.set_num_threads(runtime.get("cpu_threads", 4))
         torch.set_float32_matmul_precision("high")
         seed_everything(runtime.get("seed", 42), workers=True)
-        task = (PredictorTask if stage == "predictor" else DetectorTask)(config)
+        task = (PredictorTask(config) if stage == "predictor" else
+                DetectorTask(config, allow_uninitialized_predictor=bool(resume)))
         trainer = make_trainer(config, stage, limit_train_batches=limit_train_batches,
                                limit_val_batches=limit_val_batches)
         if trainer.is_global_zero:
@@ -165,6 +175,7 @@ def main(argv=None):
     parser.add_argument("--stage", choices=("predictor", "detector"), default="detector")
     parser.add_argument("--config", help="Defaults to configs/<stage>.yaml")
     parser.add_argument("--resume", help="Full same-stage checkpoint; restores optimizer and training recipe")
+    parser.add_argument("--predictor-checkpoint", help="Trained DINO World Predictor initializer; required for a fresh Detector")
     parser.add_argument("--output-dir")
     parser.add_argument("--max-steps", type=int, help="Optimizer steps, including steps already completed on resume")
     parser.add_argument("--epochs", type=int)
@@ -173,7 +184,11 @@ def main(argv=None):
     parser.add_argument("--limit-train-batches", type=batch_limit, default=1.0)
     parser.add_argument("--limit-val-batches", type=batch_limit, default=1.0)
     args = parser.parse_args(argv)
+    if args.resume and args.predictor_checkpoint:
+        parser.error("--resume already restores the Predictor; do not combine it with --predictor-checkpoint")
     config = load_config(args.config or f"configs/{args.stage}.yaml")
+    if args.predictor_checkpoint:
+        config["model"]["predictor_checkpoint"] = str(resolve_path(args.predictor_checkpoint))
     return run(config, stage=args.stage, resume=args.resume, output_dir=args.output_dir,
                max_steps=args.max_steps, epochs=args.epochs, batch_size=args.batch_size,
                num_workers=args.num_workers, limit_train_batches=args.limit_train_batches,

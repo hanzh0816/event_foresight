@@ -1,13 +1,13 @@
-"""Inference assembly, independent of Lightning and dataset annotations."""
+"""DINO World inference assembly, independent of Lightning and annotations."""
 
 from contextlib import nullcontext
 
 import torch
 from torch import nn
 
-from .checkpoints import TRAINING_FORMAT, read_checkpoint, load_predictor
-from .models.forecaster import DINOForecaster
-from .models.detector import FutureDetector, load_detector, postprocess
+from .checkpoints import TRAINING_FORMAT, read_checkpoint, load_predictor, input_spec, validate_forecaster
+from .models.dino_world import DINOWorldForecaster
+from .models.detector import FutureDetector, postprocess
 
 
 class ForecastDetector(nn.Module):
@@ -23,26 +23,30 @@ class ForecastDetector(nn.Module):
 
 
 def load_pipeline(config, checkpoint=None):
-    """A trained Detector restores its P; an explicit P override wins last."""
-    model = config["model"]
-    forecaster = DINOForecaster(model["dinof_checkpoint"],
-                               encoder_chunk_size=config["runtime"]["encoder_chunk_size"])
-    saved = None
-    if checkpoint:
-        saved = read_checkpoint(checkpoint)
-        if saved.get("foresight_format") != TRAINING_FORMAT or saved.get("stage") != "detector":
-            raise ValueError("--checkpoint must be a new-project Detector training checkpoint")
-        architecture = saved.get("detector_architecture")
-        if not isinstance(architecture, dict):
-            raise ValueError("Trained Detector checkpoint lacks its architecture")
-        detector = FutureDetector(**architecture)
-    else:
-        if not model.get("detector_checkpoint"):
-            raise ValueError("A detector asset or trained Detector checkpoint is required")
-        detector = load_detector(model["detector_checkpoint"])
-    pipeline = ForecastDetector(forecaster, detector)
-    if saved is not None:
-        pipeline.load_state_dict(saved["state_dict"], strict=True)
+    """Restore a complete trained World Detector, then apply an explicit P override."""
+    if not checkpoint:
+        raise ValueError("Inference requires --checkpoint with a trained DINO World Detector checkpoint")
+    saved = read_checkpoint(checkpoint)
+    if saved.get("foresight_format") != TRAINING_FORMAT or saved.get("stage") != "detector":
+        raise ValueError("--checkpoint must be a DINO World Detector training checkpoint")
+    architecture = saved.get("detector_architecture")
+    if not isinstance(architecture, dict):
+        raise ValueError("Trained Detector checkpoint lacks its architecture")
+    model, data = config["model"], config["data"]
+    forecaster = DINOWorldForecaster(
+        model["encoder_checkpoint"], image_size=data["image_size"],
+        history_length=data.get("context_frames", 4), frame_interval_s=data.get("frame_interval_s", 0.05),
+        encoder_chunk_size=config["runtime"]["encoder_chunk_size"],
+        predictor_options=model.get("predictor", {}))
+    validate_forecaster(saved, forecaster)
+    if saved.get("input_spec") != input_spec(config, forecaster):
+        raise ValueError("Detector checkpoint and configured RGB data/feature protocol differ")
+    if (architecture.get("feature_dim") != forecaster.feature_dim
+            or tuple(architecture.get("grid_size", ())) != tuple(forecaster.grid_size)
+            or architecture.get("num_classes") != 8):
+        raise ValueError("Detector architecture does not match the DINO World DSEC feature/class contract")
+    pipeline = ForecastDetector(forecaster, FutureDetector(**architecture))
+    pipeline.load_state_dict(saved["state_dict"], strict=True)
     if model.get("predictor_checkpoint"):
         load_predictor(forecaster.predictor, model["predictor_checkpoint"], forecaster=forecaster)
     return pipeline.eval().requires_grad_(False)
