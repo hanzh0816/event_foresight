@@ -69,6 +69,11 @@ class FutureDetector(nn.Module):
         super().__init__()
         self.grid_size, self.num_levels = grid_size, num_levels
         self.grid_hw = normalize_hw(grid_size, "grid_size")
+        self.architecture = dict(feature_dim=feature_dim, grid_size=list(self.grid_hw),
+                                 hidden_dim=hidden_dim, num_classes=num_classes,
+                                 num_queries=num_queries, num_levels=num_levels,
+                                 encoder_layers=encoder_layers, decoder_layers=decoder_layers,
+                                 heads=heads, points=points, mlp_dim=mlp_dim, dropout=dropout)
         groups = math.gcd(32, hidden_dim)
         self.input_proj = nn.Sequential(nn.Conv2d(feature_dim, hidden_dim, 1), nn.GroupNorm(groups, hidden_dim))
         self.downsample = nn.ModuleList([
