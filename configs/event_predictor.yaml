@@ -1,6 +1,6 @@
 # M2: historical Event-RGB fusion with active-region alignment.
 extends: predictor.yaml
-output_dir: outputs/v31_m2
+output_dir: $Work/outputs/v31_m2
 data:
   event_bins: 10
   event_activity_threshold: 1

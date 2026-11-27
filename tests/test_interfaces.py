@@ -16,6 +16,13 @@ from foresight.config import ROOT, load_config
 from foresight.evaluation.runner import read_sample_ids
 
 
+@pytest.fixture(autouse=True)
+def runtime_root(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    monkeypatch.setenv("Work", str(root))
+    return root
+
+
 def test_imports_from_unrelated_directory_without_unused_dependencies(tmp_path):
     script = '''
 import importlib.abc
@@ -40,10 +47,12 @@ assert load_config('configs/detector.yaml')['model']['encoder_checkpoint'].endsw
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_config_paths_are_project_relative(tmp_path, monkeypatch):
+def test_config_source_is_project_relative_and_assets_use_work(tmp_path, monkeypatch, runtime_root):
     monkeypatch.chdir(tmp_path)
     config = load_config("configs/detector.yaml")
-    assert Path(config["model"]["encoder_checkpoint"]).is_absolute()
+    assert Path(config["model"]["encoder_checkpoint"]) == runtime_root / "models/dino_world/dinov2_vitb14_reg4_pretrain.pth"
+    assert Path(config["data"]["root"]) == runtime_root / "DSEC"
+    assert Path(config["output_dir"]) == runtime_root / "outputs/v31_detector"
     assert config["data"]["image_size"] == [448, 896]
     assert config["runtime"]["encoder_chunk_size"] == 1
 
@@ -57,14 +66,14 @@ def test_config_rejects_unsupported_model_options(tmp_path, key):
         load_config(path)
 
 
-def test_config_accepts_separate_shared_head_and_predictor_paths(tmp_path):
+def test_config_accepts_separate_shared_head_and_predictor_paths(tmp_path, runtime_root):
     config = {"model": {"encoder_checkpoint": "encoder.pth", "predictor_checkpoint": "predictor.ckpt",
                         "detector_checkpoint": "head.ckpt"}}
     path = tmp_path / "shared-head.yaml"
     path.write_text(json.dumps(config))
     loaded = load_config(path)
     for key in ("encoder_checkpoint", "predictor_checkpoint", "detector_checkpoint"):
-        assert Path(loaded["model"][key]) == ROOT / config["model"][key]
+        assert Path(loaded["model"][key]) == runtime_root / config["model"][key]
 
 
 def test_event_config_derives_channels_alignment_and_zero_gate_initializer(tmp_path):

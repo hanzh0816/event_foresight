@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 from PIL import Image
 
+from foresight.config import resolve_path
 from foresight.data import CLASSES, DEFAULT_SPLITS, HEIGHT, WIDTH, RGBDataset, RGBSequenceReader
 
 
@@ -195,7 +196,7 @@ def check_dsec(root, *, rgb_only=False, deep=False, event_window_us=50000,
     require(event_window_us in (50000, 200000), "event_window_us must be 50000 or 200000")
     require(event_endpoint in ("rgb_timestamp", "exposure_end"),
             "event_endpoint must be rgb_timestamp or exposure_end")
-    root = Path(root).expanduser().resolve()
+    root = resolve_path(root)
     report = dict(root=str(root), mode="rgb" if rgb_only else "rgb+event", deep=deep,
                   event_window_us=event_window_us, event_endpoint=event_endpoint,
                   v31_event_protocol=not rgb_only and event_window_us == 50000 and event_endpoint == "rgb_timestamp",
@@ -233,8 +234,8 @@ def main(argv=None):
     parser.add_argument("--deep", action="store_true", help="Decode all PNGs and scan all event chunks (slow)")
     parser.add_argument("--output", help="Optional JSON report path outside DSEC (overwrites an existing report)")
     args = parser.parse_args(argv)
-    output = Path(args.output).expanduser().resolve() if args.output else None
-    root = Path(args.data_root).expanduser().resolve()
+    output = resolve_path(args.output) if args.output else None
+    root = resolve_path(args.data_root)
     if output and output.is_relative_to(root):
         parser.error("--output must be outside the DSEC root")
     report = check_dsec(root, rgb_only=args.rgb_only, deep=args.deep, event_window_us=args.event_window_us,

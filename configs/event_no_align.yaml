@@ -1,5 +1,5 @@
 # M1: same Event-RGB model and prediction loss without alignment supervision.
 extends: event_predictor.yaml
-output_dir: outputs/v31_m1
+output_dir: $Work/outputs/v31_m1
 optimization:
   align_weight: 0.0

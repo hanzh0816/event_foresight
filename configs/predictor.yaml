@@ -1,11 +1,11 @@
 # B1: RGB baseline. All model comparisons share this budget and detection head.
 stage: predictor
-output_dir: outputs/v31_b1
+output_dir: $Work/outputs/v31_b1
 # Optional epochs/max_steps changes when resuming; otherwise retain the saved recipe.
 resume_overrides: {}
 
 data:
-  root: /data3/hzh/DSEC
+  root: $Work/DSEC
   image_size: [448, 896]
   sample_history_frames: 40
   context_frames: 4
@@ -21,10 +21,10 @@ data:
   prefetch_factor: 1
 
 model:
-  encoder_checkpoint: /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
+  encoder_checkpoint: $Work/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
   predictor_checkpoint: null
   rgb_checkpoint: null
-  detector_checkpoint: outputs/v31_detector/checkpoints/best.ckpt
+  detector_checkpoint: $Work/outputs/v31_detector/checkpoints/best.ckpt
   event:
     enabled: false
   predictor:
@@ -70,7 +70,7 @@ runtime:
 evaluation:
   split: val
   manifest: null
-  output: outputs/metrics.json
+  output: $Work/outputs/metrics.json
   batch_size: 1
   max_samples: null
   horizon_steps: 1

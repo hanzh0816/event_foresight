@@ -6,19 +6,22 @@
 
 ## 安装、权重与数据
 
-以下命令在训练服务器执行：
+在每台训练服务器设置 `Work`，指向存放数据、权重和训练产物的根目录。变量名区分大小写；以下示例沿用 Delta 的数据盘位置：
 
 ```bash
+export Work=/data3/hzh
 python -m pip install -e '.[event,test]'
-mkdir -p /data3/hzh/models/dino_world
+mkdir -p "$Work/models/dino_world"
 curl -fL --retry 3 -C - \
   'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth' \
-  -o /data3/hzh/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
+  -o "$Work/models/dino_world/dinov2_vitb14_reg4_pretrain.pth"
 ```
 
 已有该权重时无需重新下载。模型严格加载本地官方 `dinov2_vitb14_reg4_pretrain.pth`；不自动下载。编码器去掉 CLS/register tokens，使用最后层经 LayerNorm 的 768 维 patch 特征，无 PCA。
 
-在 `configs/predictor.yaml` 和 `configs/detector.yaml` 设置 `data.root`、`model.encoder_checkpoint`。事件配置继承 RGB predictor 配置。数据需要 DSEC detection 已映射到左事件相机坐标的 `images/left/distorted`、`images/timestamps.txt`、`object_detections/left/tracks.npy`，以及 `events/left/events.h5`。具体坐标与目录约定见 [输入数据](docs/v31.md#输入数据与时间边界)。
+配置统一使用 `$Work/DSEC`、`$Work/models/` 和 `$Work/outputs/`。保持这组子目录布局时，切换服务器只需修改 `Work`；目录不同则调整 YAML 中对应后缀。事件配置继承 RGB predictor 配置。数据需要 DSEC detection 已映射到左事件相机坐标的 `images/left/distorted`、`images/timestamps.txt`、`object_detections/left/tracks.npy`，以及 `events/left/events.h5`。具体坐标与目录约定见 [输入数据](docs/v31.md#输入数据与时间边界)。
+
+默认配置要求 `Work` 是非空绝对路径，未设置时会报错。YAML 和命令行中的运行路径支持 `$Work`、`${Work}`；不带根目录的相对路径也从 `Work` 解析，绝对路径可直接使用。`--config` 仍相对代码仓库，`extends` 相对当前 YAML，详细规则见 [配置与训练预算](docs/v31.md#配置与训练预算)。旧仓库中的 `outputs/` 不会自动迁移。
 
 ## 训练与评测
 
@@ -29,7 +32,7 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
   --config configs/detector.yaml
 ```
 
-检测头训练不需要 predictor checkpoint。训练完成后，在 `configs/predictor.yaml` 设置 `model.detector_checkpoint: outputs/v31_detector/checkpoints/best.ckpt`，所有预测器共用该冻结头。
+检测头训练不需要 predictor checkpoint。`configs/predictor.yaml` 已将共享头设为 `$Work/outputs/v31_detector/checkpoints/best.ckpt`；训练完成后，所有预测器共用该冻结头。
 
 2. 训练完整 Event-RGB 模型 M2：
 
@@ -38,7 +41,7 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
   --config configs/event_predictor.yaml
 ```
 
-将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1。配置已包含训练阶段和输出目录，分别保存到 `outputs/v31_b1`、`outputs/v31_m1`、`outputs/v31_m2`。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
+将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1。配置已包含训练阶段和输出目录，分别保存到 `$Work/outputs/v31_b1`、`$Work/outputs/v31_m1`、`$Work/outputs/v31_m2`。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
 
 实验设置写在 YAML 中：`data` 管理 batch 和 workers，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。训练命令只接受 `--config`、`--resume` 和可选的 `--output-dir`。恢复默认沿用 checkpoint 配方；字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
 
@@ -61,4 +64,4 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.evaluate \
 - [Event 表征调研](docs/event-representation-survey.md)：相关文献。
 - [上游来源](foresight/vendor/SOURCES.json)、[检测模块许可证](foresight/models/detection/APACHE-LICENSE)：保留的第三方代码来源与许可。
 
-权重、数据和 `outputs/` 不提交到 Git。
+权重、数据和 `$Work/outputs/` 不提交到 Git。

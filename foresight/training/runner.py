@@ -13,7 +13,7 @@ from lightning.pytorch.strategies import DDPStrategy
 import torch
 import yaml
 
-from ..config import ROOT, resolve_path
+from ..config import resolve_path
 from .base import CHECKPOINT_FORMAT
 from .detector import DetectorTask
 from .monitoring import TrainingTensorBoardLogger
@@ -40,7 +40,8 @@ def make_trainer(config, stage, *, limit_train_batches=None, limit_val_batches=N
     checkpoint_options = dict(dirpath=folder / "checkpoints", save_last=True,
                               enable_version_counter=False, auto_insert_metric_name=False)
     if limit_val_batches:
-        monitor, mode = ("val_AP", "max") if stage == "detector" or config["model"].get("detector_checkpoint") else ("val_feature_loss", "min")
+        has_head = config["model"].get("detector_checkpoint") or config.get("resume_detector_checkpoint")
+        monitor, mode = ("val_AP", "max") if stage == "detector" or has_head else ("val_feature_loss", "min")
         checkpoint = ModelCheckpoint(filename="best", monitor=monitor, mode=mode,
                                      save_top_k=1, save_on_train_epoch_end=False, **checkpoint_options)
     else:
@@ -89,8 +90,9 @@ def resume_config(config, checkpoint, stage):
     restored["model"]["encoder_checkpoint"] = config["model"]["encoder_checkpoint"]
     restored["model"]["predictor_checkpoint"] = None
     restored["model"]["rgb_checkpoint"] = None
-    if config["model"].get("detector_checkpoint"):
-        restored["model"]["detector_checkpoint"] = config["model"]["detector_checkpoint"]
+    # A full predictor checkpoint owns its validation head. Do not retain a
+    # previous server's external path or add a head from the current defaults.
+    restored["model"]["detector_checkpoint"] = None
     restored.pop("resume_detector_checkpoint", None)
     if stage == "predictor" and saved.get("detector_architecture") is not None:
         restored["resume_detector_checkpoint"] = str(checkpoint)
@@ -156,7 +158,7 @@ def run(config, *, stage=None, resume=None, output_dir=None, max_steps=None, epo
         folder = resolve_path(configured_output)
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        folder = ROOT / "outputs" / f"{stage}_{stamp}"
+        folder = resolve_path(f"outputs/{stage}_{stamp}")
     # Lightning's subprocess ranks inherit this run's directory after rank zero
     # has written config_train.yaml. Only a fresh invocation checks for reuse.
     child_rank = inherited == str(folder) and "LOCAL_RANK" in os.environ

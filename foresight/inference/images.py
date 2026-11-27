@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 import torch
 
+from ..config import resolve_path
 from ..data import CLASSES, HEIGHT, WIDTH, preprocess_rgb
 from .pipeline import load_pipeline, setup_cuda, inference_context
 
@@ -33,10 +34,9 @@ def infer_images(config, image_paths, *, events_path=None, output):
     if (type(score_threshold) not in (int, float) or not math.isfinite(score_threshold)
             or not 0 <= score_threshold <= 1):
         raise ValueError("inference.score_threshold must lie in [0,1]")
-    # Explicit input/output files follow the shell cwd.
-    paths = [Path(value).expanduser().resolve() for value in image_paths]
-    output = Path(output).expanduser().resolve()
-    events_path = Path(events_path).expanduser().resolve() if events_path else None
+    paths = [resolve_path(value) for value in image_paths]
+    output = resolve_path(output)
+    events_path = resolve_path(events_path) if events_path else None
     protected = paths + [Path(v).resolve() for v in config["model"].values() if isinstance(v, str)]
     if events_path is not None:
         protected.append(events_path)

@@ -2,6 +2,6 @@
 extends: predictor.yaml
 model:
   rgb_checkpoint: null
-  predictor_checkpoint: outputs/v31_b1/checkpoints/best.ckpt
+  predictor_checkpoint: $Work/outputs/v31_b1/checkpoints/best.ckpt
 evaluation:
-  output: outputs/v31_b1_val.json
+  output: $Work/outputs/v31_b1_val.json

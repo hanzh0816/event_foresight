@@ -1,20 +1,57 @@
-"""Small, explicit project configuration; paths never depend on shell cwd."""
+"""YAML configuration; source paths use the repository, runtime paths use $Work."""
 
 from copy import deepcopy
+import os
 from pathlib import Path
+import re
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+_ENV_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def work_root():
+    """Read the case-sensitive runtime root without an implicit machine default."""
+    value = os.environ.get("Work")
+    if value is None or not value.strip():
+        raise ValueError("Set Work to an absolute runtime root, for example: export Work=/data3/hzh")
+    path = Path(value).expanduser()
+    if not path.is_absolute() or _ENV_VAR.search(str(path)):
+        raise ValueError("Work must be an absolute path with no unexpanded environment variables")
+    return path.resolve()
+
+
+def _expand_path(value):
+    def replace(match):
+        name = match.group(1) or match.group(2)
+        if name == "Work":
+            return str(work_root())
+        replacement = os.environ.get(name)
+        if replacement is None or not replacement.strip():
+            raise ValueError(f"Path environment variable {name!r} is unset or empty")
+        return replacement
+
+    expanded = _ENV_VAR.sub(replace, os.fspath(value))
+    if _ENV_VAR.search(expanded):
+        raise ValueError(f"Path contains unexpanded environment variables: {value}")
+    return Path(expanded).expanduser()
 
 
 def resolve_path(value):
-    path = Path(value).expanduser()
+    """Expand an asset/input/output path, resolving relative paths under $Work."""
+    path = _expand_path(value)
+    return (path if path.is_absolute() else work_root() / path).resolve()
+
+
+def resolve_config_path(value):
+    """Locate a source configuration independently of the runtime/data root."""
+    path = _expand_path(value)
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
 def load_config(filename, _seen=None):
-    path = resolve_path(filename)
+    path = resolve_config_path(filename)
     with path.open() as handle:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
@@ -25,7 +62,7 @@ def load_config(filename, _seen=None):
     seen.add(path)
     parent = config.pop("extends", None)
     if parent:
-        base = load_config(path.parent / parent, seen)
+        base = load_config(path.parent / _expand_path(parent), seen)
         def merge(left, right):
             result = deepcopy(left)
             for key, value in right.items():

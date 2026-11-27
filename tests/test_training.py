@@ -395,7 +395,7 @@ def test_predictor_resume_restores_embedded_head_without_external_checkpoint(tmp
     torch.save(payload, checkpoint)
     restored_config = resume_config(config(tmp_path), checkpoint, 'predictor')
     assert restored_config['resume_detector_checkpoint'] == str(checkpoint)
-    assert restored_config['model']['detector_checkpoint'] == str(tmp_path / 'missing-original-head.ckpt')
+    assert restored_config['model']['detector_checkpoint'] is None
 
     def external_head_forbidden(*args, **kwargs):
         raise AssertionError('Full resume must use its embedded validation head')

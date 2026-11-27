@@ -1,7 +1,7 @@
 # Train one shared detection head on real frozen DINO features.
 extends: predictor.yaml
 stage: detector
-output_dir: outputs/v31_detector
+output_dir: $Work/outputs/v31_detector
 data:
   batch_size: 4
   num_workers: 4

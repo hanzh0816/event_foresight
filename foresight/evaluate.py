@@ -1,9 +1,8 @@
 """Evaluate future detection on a DSEC split or an explicit sample inventory."""
 
 import argparse
-from pathlib import Path
 
-from .config import load_config
+from .config import load_config, resolve_path
 from .evaluation.runner import evaluate
 
 
@@ -13,8 +12,7 @@ def main(argv=None):
     parser.add_argument("--output", help="Override evaluation.output for this run")
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    # Explicit CLI paths follow the shell cwd; YAML paths follow the project root.
-    output = Path(args.output).expanduser().resolve() if args.output is not None else None
+    output = resolve_path(args.output) if args.output is not None else None
     return evaluate(config, output=output)
 
 
