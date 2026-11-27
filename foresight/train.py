@@ -9,12 +9,13 @@ from pathlib import Path
 
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
+from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.strategies import DDPStrategy
 import torch
 import yaml
 
 from .config import ROOT, load_config, resolve_path
+from .monitoring import TrainingTensorBoardLogger
 from .training import CHECKPOINT_FORMAT, DetectorTask, PredictorTask
 
 
@@ -68,7 +69,8 @@ def make_trainer(config, stage, *, limit_train_batches=1.0, limit_val_batches=1.
         gradient_clip_val=options.get("clip_grad", 1.0),
         default_root_dir=folder, callbacks=callbacks,
         logger=[CSVLogger(folder, name="logs", version=None),
-                TensorBoardLogger(folder, name="tensorboard", version=None, default_hp_metric=False)],
+                TrainingTensorBoardLogger(folder, name="tensorboard", version=None,
+                                          default_hp_metric=False, stage=stage)],
         limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
         log_every_n_steps=runtime.get("log_every", 10), num_sanity_val_steps=0,
         use_distributed_sampler=False,

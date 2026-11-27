@@ -42,6 +42,8 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
 
 将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1，并使用独立输出目录。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
 
+观察训练时，在 TensorBoard 的 Scalars 中筛选 `^monitor/`，或打开 Custom Scalars 的 `Training overview`。其余指标归入 `details/`；完整 CSV 和逐轮验证报告继续保留。启动命令与指标含义见 [训练日志](docs/v31.md#训练日志)。
+
 3. 用同一个共享头评测预测器：
 
 ```bash

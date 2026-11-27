@@ -2,9 +2,7 @@
 
 from copy import deepcopy
 import inspect
-import json
 import math
-from pathlib import Path
 
 from lightning.pytorch import LightningModule
 import torch
@@ -14,6 +12,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from .samplers import ValidationSampler
 from .checkpoints import TRAINING_FORMAT, input_spec, validate_forecaster
+from .monitoring import validation_scalars, write_validation_report
 
 CHECKPOINT_FORMAT = TRAINING_FORMAT
 
@@ -117,7 +116,24 @@ class _ForecastTask(LightningModule):
             if parameter.grad is not None:
                 parameter.grad.mul_(scale)
         self.log("train_global_batch", count, on_step=True, on_epoch=False, sync_dist=False)
+        if optimizer is not None:
+            groups = optimizer.param_groups
+            if self.stage == "predictor" and getattr(self.forecaster, "event_encoder", None) is not None:
+                names = ("predictor", "event_fusion", "event_encoder") if len(groups) == 3 else ("predictor", "event_encoder")
+            else:
+                names = (self.stage,)
+            for index, group in enumerate(groups):
+                name = group.get("name", names[index] if index < len(names) else f"group_{index}")
+                self.log(f"lr_{name}", group["lr"], on_step=True, on_epoch=False, sync_dist=False)
         self.accumulated_examples = 0
+
+    def _log_validation_report(self):
+        for name, value in validation_scalars(self.last_report).items():
+            self.log(name, value, prog_bar=name in ("val_AP", "val_feature_loss"), sync_dist=False)
+        if self.global_rank == 0 and self.config.get("output_dir"):
+            write_validation_report(self.config["output_dir"], self.last_report,
+                                    epoch=self.current_epoch, global_step=self.global_step,
+                                    log_dir=getattr(self.logger, "log_dir", None))
 
     def configure_optimizers(self):
         options = self.config["optimization"]
@@ -362,19 +378,9 @@ class PredictorTask(_ForecastTask):
             detection = _detection_report(self, self.validation_predictions)
             self.last_report["metrics"].update(detection["metrics"])
             self.last_report["per_class"] = detection.get("per_class", {})
-            self.log("val_AP", detection["metrics"]["AP"], prog_bar=True, sync_dist=False)
-        self.log("val_feature_loss", metrics["prediction_loss"], prog_bar=True, sync_dist=False)
-        if "foreground_l1" in metrics:
-            self.log("val_foreground_l1", metrics["foreground_l1"], sync_dist=False)
-        self.log("val_samples", count, sync_dist=False)
-        self._write_report()
+            self.last_report["metadata"]["detection"] = detection["metadata"]
+        self._log_validation_report()
         self.last_validation_step = int(self.global_step)
-
-    def _write_report(self):
-        if self.global_rank == 0 and self.config.get("output_dir"):
-            path = Path(self.config["output_dir"]) / "metrics_val.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(self.last_report, indent=2) + "\n")
 
 
 class DetectorTask(_ForecastTask):
@@ -458,17 +464,10 @@ class DetectorTask(_ForecastTask):
 
     def on_validation_epoch_end(self):
         report = _detection_report(self, self.validation_predictions)
-        if self.global_rank == 0:
-            report["metadata"].update(stage=self.stage, feature_source="real_frozen_dinov2",
-                                      input_spec=self.input_spec)
-            if self.config.get("output_dir"):
-                path = Path(self.config["output_dir"]) / "metrics_val.json"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(report, indent=2) + "\n")
+        report["metadata"].update(stage=self.stage, feature_source="real_frozen_dinov2",
+                                  input_spec=self.input_spec)
         self.last_report = report
-        self.log_dict({f"val_{key}": float(value) for key, value in report["metrics"].items()
-                       if value is not None}, prog_bar=True, sync_dist=False)
-        self.log("val_samples", float(report["metadata"]["num_samples"]), sync_dist=False)
+        self._log_validation_report()
         self.validation_predictions = []
         self.last_validation_step = int(self.global_step)
 
