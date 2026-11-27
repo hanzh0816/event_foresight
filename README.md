@@ -1,6 +1,6 @@
 # Event Foresight v3.1
 
-用历史 RGB 与事件预测 DSEC 下一时刻的 DINOv2 特征，再用共享冻结检测头评测未来目标检测。默认间隔 50 ms，四帧历史；模型由冻结 DINOv2、RVT-S 和 8 层双路 Cross-Attention 预测器组成。
+用历史 RGB 与事件预测 DSEC 下一时刻的 DINOv2 特征，再用共享冻结检测头评测未来目标检测。默认间隔 50 ms，四帧历史；模型由冻结 DINOv2、RVT-S 和 8 层双路 Cross-Attention 预测器组成。B1/M1/M2 可以直接开始自监督训练，无需先训练或加载检测头。
 
 实现以项目 v3.1 设计为准。架构、监督、消融与验证记录见 [docs/v31.md](docs/v31.md)。2026-11-27 已在 Delta 完成无训练检查，包括真实 DSEC 的 batch 1/3 BF16 前向、反向与因果性验证；尚未启动训练或评测 AP。
 
@@ -25,36 +25,48 @@ curl -fL --retry 3 -C - \
 
 ## 训练与评测
 
-1. 先用真实 RGB 的冻结 DINO 特征训练共享检测头：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
-  --config configs/detector.yaml
-```
-
-检测头训练不需要 predictor checkpoint。`configs/predictor.yaml` 已将共享头设为 `$Work/outputs/v31_detector/checkpoints/best.ckpt`；训练完成后，所有预测器共用该冻结头。
-
-2. 训练完整 Event-RGB 模型 M2：
+在仓库目录运行。完整 Event-RGB 模型 M2 直接启动：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
   --config configs/event_predictor.yaml
 ```
 
-将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1。配置已包含训练阶段和输出目录，分别保存到 `$Work/outputs/v31_b1`、`$Work/outputs/v31_m1`、`$Work/outputs/v31_m2`。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
+M2 联合训练 RVT、Event neck 和 predictor，DINOv2 冻结；监督来自未来特征预测和历史 Event-RGB 对齐损失。默认 `model.detector_checkpoint: null`，不加载检测头、不计算 AP。`best.ckpt` 按验证预测损失 `val_feature_loss` 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
+
+RGB 基线 B1 和无对齐辅助的消融 M1 分别启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
+  --config configs/predictor.yaml
+
+CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
+  --config configs/event_no_align.yaml
+```
+
+三组相互独立，M2 不需要 B1 权重。配置分别保存到 `$Work/outputs/v31_b1`、`$Work/outputs/v31_m1`、`$Work/outputs/v31_m2`。默认每卡 batch 1、累积 8 步、40 epochs。当前继续使用原来目标帧有有效检测框的样本集合，数据加载仍需 `tracks.npy`；检测框用于筛选窗口和统计前景指标，不进入 predictor 的训练 loss。
+
+共享检测头使用真实 RGB 的冻结 DINO 特征和检测标注独立训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
+  --config configs/detector.yaml
+```
+
+默认每卡 batch 4、累积 1 步、40 epochs，最佳权重保存为 `$Work/outputs/v31_detector/checkpoints/best.ckpt`。它与 predictor 训练相互独立，可分配不同 GPU 同时训练。上面的 `0` 为卡号示例，需替换为实际分配的 GPU。
 
 实验设置写在 YAML 中：`data` 管理 batch 和 workers，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。训练命令只接受 `--config`、`--resume` 和可选的 `--output-dir`。恢复默认沿用 checkpoint 配方；字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
 
 观察训练时，在 TensorBoard 的 Scalars 中筛选 `^monitor/`，或打开 Custom Scalars 的 `Training overview`。其余指标归入 `details/`；完整 CSV 和逐轮验证报告继续保留。启动命令与指标含义见 [训练日志](docs/v31.md#训练日志)。
 
-3. 用同一个共享头评测预测器：
+predictor 与检测头都完成后，用同一个冻结头评测：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.evaluate \
   --config configs/evaluate_event.yaml
 ```
 
-`configs/evaluate_event.yaml` 已指定 M2 predictor 权重、共享检测头和结果路径；B1 使用 `configs/evaluate_rgb.yaml`。调整 YAML 的 `evaluation` 部分可选择 split、事件干预、预测步数和子集，临时结果路径可用 `--output` 覆盖。
+`configs/evaluate_event.yaml` 已指定 M2 predictor 权重、共享检测头和结果路径；B1 使用 `configs/evaluate_rgb.yaml`。调整 YAML 的 `evaluation` 部分可选择 split、事件干预、预测步数和子集，临时结果路径可用 `--output` 覆盖。需要在 predictor 训练期间验证 AP 时，见 [可选 AP 验证](docs/v31.md#共享检测头与-checkpoint)。
 
 评测输出 COCO AP/AR、类别 AP、分区域 latent 指标、样本清单及预测框。AP 使用 0 到 1 的数值，框坐标对应原图 `640×480`。多步 rollout、高动态子集和独立图片推理的用法见 [评测与推理](docs/v31.md#评测与推理)。
 

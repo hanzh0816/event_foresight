@@ -1,4 +1,4 @@
-# B1: RGB baseline. All model comparisons share this budget and detection head.
+# B1: RGB baseline. Pretrain without a detector; use one shared head for AP evaluation.
 stage: predictor
 output_dir: $Work/outputs/v31_b1
 # Optional epochs/max_steps changes when resuming; otherwise retain the saved recipe.
@@ -24,7 +24,8 @@ model:
   encoder_checkpoint: $Work/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
   predictor_checkpoint: null
   rgb_checkpoint: null
-  detector_checkpoint: $Work/outputs/v31_detector/checkpoints/best.ckpt
+  # Optional: provide a trained shared head to validate AP and select best.ckpt by AP.
+  detector_checkpoint: null
   event:
     enabled: false
   predictor:
