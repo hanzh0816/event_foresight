@@ -26,8 +26,7 @@ curl -fL --retry 3 -C - \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
-  --stage detector --config configs/detector.yaml \
-  --output-dir outputs/v31_detector
+  --config configs/detector.yaml
 ```
 
 检测头训练不需要 predictor checkpoint。训练完成后，在 `configs/predictor.yaml` 设置 `model.detector_checkpoint: outputs/v31_detector/checkpoints/best.ckpt`，所有预测器共用该冻结头。
@@ -36,11 +35,12 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
-  --stage predictor --config configs/event_predictor.yaml \
-  --output-dir outputs/v31_m2
+  --config configs/event_predictor.yaml
 ```
 
-将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1，并使用独立输出目录。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
+将配置换为 `configs/predictor.yaml` 或 `configs/event_no_align.yaml` 可分别训练 RGB 基线 B1、无对齐辅助的 M1。配置已包含训练阶段和输出目录，分别保存到 `outputs/v31_b1`、`outputs/v31_m1`、`outputs/v31_m2`。默认每卡 batch 1、累积 8 步、40 epochs；预算和显存需在服务器核查。提供共享头时 `best.ckpt` 按 val AP 选择，`best_foreground.ckpt` 按前景 latent L1 选择，`last.ckpt` 用于恢复。
+
+实验设置写在 YAML 中：`data` 管理 batch 和 workers，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。训练命令只接受 `--config`、`--resume` 和可选的 `--output-dir`。恢复默认沿用 checkpoint 配方；字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
 
 观察训练时，在 TensorBoard 的 Scalars 中筛选 `^monitor/`，或打开 Custom Scalars 的 `Training overview`。其余指标归入 `details/`；完整 CSV 和逐轮验证报告继续保留。启动命令与指标含义见 [训练日志](docs/v31.md#训练日志)。
 
@@ -48,14 +48,12 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m foresight.evaluate \
-  --config configs/event_predictor.yaml --split val \
-  --checkpoint outputs/v31_detector/checkpoints/best.ckpt \
-  --predictor-checkpoint outputs/v31_m2/checkpoints/best.ckpt \
-  --event-mode correct --horizon-steps 1 \
-  --output outputs/v31_m2_val.json
+  --config configs/evaluate_event.yaml
 ```
 
-评测输出 COCO AP/AR、类别 AP、分区域 latent 指标、样本清单及预测框。AP 使用 0 到 1 的数值，框坐标对应原图 `640×480`。`--event-mode`、多步 rollout、高动态子集和独立图片推理的用法见 [评测与推理](docs/v31.md#评测与推理)。
+`configs/evaluate_event.yaml` 已指定 M2 predictor 权重、共享检测头和结果路径；B1 使用 `configs/evaluate_rgb.yaml`。调整 YAML 的 `evaluation` 部分可选择 split、事件干预、预测步数和子集，临时结果路径可用 `--output` 覆盖。
+
+评测输出 COCO AP/AR、类别 AP、分区域 latent 指标、样本清单及预测框。AP 使用 0 到 1 的数值，框坐标对应原图 `640×480`。多步 rollout、高动态子集和独立图片推理的用法见 [评测与推理](docs/v31.md#评测与推理)。
 
 ## 文件入口
 

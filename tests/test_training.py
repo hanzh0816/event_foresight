@@ -12,7 +12,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 from foresight.training import CHECKPOINT_FORMAT, DetectorTask, PredictorTask
 from foresight.samplers import ValidationSampler
-from foresight.train import batch_limit, make_trainer, resume_config, ValidateAtStepBudget
+from foresight.train import make_trainer, resume_config, ValidateAtStepBudget
 
 
 class TinyPredictor(nn.Module):
@@ -200,24 +200,22 @@ def test_validation_sampler_no_duplicates_and_empty_rank_placeholder():
     assert list(empty) == [0] and len(empty) == 1
 
 
-def test_trainer_uses_all_visible_gpus_and_cli_batch_limit(monkeypatch, tmp_path):
+def test_trainer_uses_all_visible_gpus_and_configured_batch_limits(monkeypatch, tmp_path):
     monkeypatch.setattr("foresight.train.torch.cuda.device_count", lambda: 2)
     monkeypatch.setattr("foresight.train.Trainer", lambda **kwargs: kwargs)
-    kwargs = make_trainer(config(tmp_path), "predictor", limit_train_batches=2, limit_val_batches=0)
+    cfg = config(tmp_path)
+    cfg["runtime"].update(limit_train_batches=2, limit_val_batches=0)
+    kwargs = make_trainer(cfg, "predictor")
     assert kwargs["devices"] == "auto" and kwargs["accelerator"] == "gpu"
     assert kwargs["use_distributed_sampler"] is False
+    assert kwargs["limit_train_batches"] == 2 and kwargs["limit_val_batches"] == 0
     assert kwargs["strategy"]._ddp_kwargs["broadcast_buffers"] is False
     first_logger = kwargs["logger"][0]
     first_logger.log_metrics({"loss": 1.0}, step=0)
     first_logger.save()
-    second = make_trainer(config(tmp_path), "predictor", limit_train_batches=2, limit_val_batches=0)
+    second = make_trainer(cfg, "predictor")
     assert second["logger"][0].log_dir != first_logger.log_dir
     assert (tmp_path / "logs" / "version_0" / "metrics.csv").is_file()
-    assert batch_limit("2") == 2 and type(batch_limit("2")) is int
-    assert batch_limit("1.0") == 1.0 and type(batch_limit("1.0")) is float
-    assert batch_limit("0.25") == 0.25
-    with pytest.raises(Exception):
-        batch_limit("2.5")
 
 
 def test_resume_recipe_preserves_budget_and_selection(monkeypatch, tmp_path):
@@ -351,18 +349,22 @@ def test_budget_validates_and_saves_best_and_last(tmp_path, max_steps, max_epoch
         assert all(torch.equal(task.state_dict()[key], value) for key, value in saved["state_dict"].items())
 
 
-def test_train_cli_predictor_initializer_is_explicit(tmp_path, monkeypatch):
+def test_train_cli_uses_configured_stage_and_initializer(tmp_path, monkeypatch):
     from foresight import train
-    monkeypatch.setattr(train, "load_config", lambda path: config(tmp_path))
-    monkeypatch.setattr(train, "run", lambda cfg, **kwargs: (cfg, kwargs))
     checkpoint = tmp_path / "predictor.ckpt"
-    cfg, options = train.main(["--stage", "predictor", "--predictor-checkpoint", str(checkpoint)])
+    recipe = config(tmp_path)
+    recipe["stage"] = "predictor"
+    recipe["model"]["predictor_checkpoint"] = str(checkpoint)
+    monkeypatch.setattr(train, "load_config", lambda path: deepcopy(recipe))
+    monkeypatch.setattr(train, "run", lambda cfg, **kwargs: (cfg, kwargs))
+    cfg, options = train.main(["--config", "experiment.yaml"])
     assert cfg["model"]["predictor_checkpoint"] == str(checkpoint)
     assert options["stage"] == "predictor" and options["resume"] is None
     with pytest.raises(SystemExit):
-        train.main(["--stage", "predictor", "--resume", "last.ckpt", "--predictor-checkpoint", str(checkpoint)])
+        train.main(["--config", "experiment.yaml", "--stage", "predictor"])
+    recipe.pop("stage")
     with pytest.raises(SystemExit):
-        train.main(["--stage", "detector", "--predictor-checkpoint", str(checkpoint)])
+        train.main(["--config", "experiment.yaml"])
 
 
 def test_shared_head_enables_ap_selection_and_separate_foreground_checkpoint(tmp_path, monkeypatch):

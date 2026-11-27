@@ -1,4 +1,9 @@
 # B1: RGB baseline. All model comparisons share this budget and detection head.
+stage: predictor
+output_dir: outputs/v31_b1
+# Optional epochs/max_steps changes when resuming; otherwise retain the saved recipe.
+resume_overrides: {}
+
 data:
   root: /data3/hzh/DSEC
   image_size: [448, 896]
@@ -58,3 +63,22 @@ runtime:
   encoder_chunk_size: 1
   cpu_threads: 4
   log_every: 10
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+
+# Standalone evaluation only; training validation remains single-step.
+evaluation:
+  split: val
+  manifest: null
+  output: outputs/metrics.json
+  batch_size: 1
+  max_samples: null
+  horizon_steps: 1
+  event_mode: correct  # correct, mismatched, bin_reverse, zero, or "off" (quote off)
+  subset: all
+  top_fraction: 0.2
+  persistence: false
+
+inference:
+  horizon_steps: 1
+  score_threshold: 0.0

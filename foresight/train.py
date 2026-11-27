@@ -19,20 +19,6 @@ from .monitoring import TrainingTensorBoardLogger
 from .training import CHECKPOINT_FORMAT, DetectorTask, PredictorTask
 
 
-def batch_limit(value):
-    """Integer means batches; a float in [0, 1] means a fraction of the loader."""
-    text = str(value)
-    try:
-        if text.isdigit():
-            return int(text)
-        fraction = float(text)
-        if 0 <= fraction <= 1:
-            return fraction
-    except ValueError:
-        pass
-    raise argparse.ArgumentTypeError("Use an integer batch count or a fraction between 0 and 1")
-
-
 class ValidateAtStepBudget(Callback):
     """Request the normal fit-loop validation when a step budget ends mid-epoch."""
 
@@ -43,8 +29,12 @@ class ValidateAtStepBudget(Callback):
             trainer.should_stop = True
 
 
-def make_trainer(config, stage, *, limit_train_batches=1.0, limit_val_batches=1.0):
+def make_trainer(config, stage, *, limit_train_batches=None, limit_val_batches=None):
     options, runtime = config["optimization"], config["runtime"]
+    if limit_train_batches is None:
+        limit_train_batches = runtime.get("limit_train_batches", 1.0)
+    if limit_val_batches is None:
+        limit_val_batches = runtime.get("limit_val_batches", 1.0)
     folder = Path(config["output_dir"])
     checkpoint_options = dict(dirpath=folder / "checkpoints", save_last=True,
                               enable_version_counter=False, auto_insert_metric_name=False)
@@ -90,7 +80,7 @@ def resume_config(config, checkpoint, stage):
             restored["data"][key] = config["data"][key]
     # Seed, precision and encoder chunking affect the data/numerical protocol.
     # Keep them from the checkpoint; only execution/logging knobs may relocate.
-    for key in ("cpu_threads", "log_every"):
+    for key in ("cpu_threads", "log_every", "limit_train_batches", "limit_val_batches"):
         if key in config["runtime"]:
             restored["runtime"][key] = config["runtime"][key]
     # Full resume will restore all parameter values. Only the initial asset
@@ -109,16 +99,27 @@ def resume_config(config, checkpoint, stage):
             raise ValueError("Detector resume checkpoint is missing its architecture")
         restored["detector"] = {key: value for key, value in architecture.items()
                                 if key not in ("feature_dim", "grid_size")}
+    restored["stage"] = stage
+    # Explicit resume edits stay separate from defaults in a fresh recipe.
+    restored["resume_overrides"] = deepcopy(config.get("resume_overrides", {}))
+    for key, value in restored["resume_overrides"].items():
+        restored["optimization"][key] = value
     return restored
 
 
-def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=None, epochs=None,
-        batch_size=None, num_workers=None, limit_train_batches=1.0, limit_val_batches=1.0):
+def run(config, *, stage=None, resume=None, output_dir=None, max_steps=None, epochs=None,
+        batch_size=None, num_workers=None, limit_train_batches=None, limit_val_batches=None):
+    stage = stage or config.get("stage")
     if stage not in ("predictor", "detector"):
         raise ValueError("stage must be predictor or detector")
+    if not resume and config.get("resume_overrides"):
+        raise ValueError("resume_overrides requires --resume")
+    if stage == "detector" and any(config["model"].get(key) for key in ("predictor_checkpoint", "rgb_checkpoint")):
+        raise ValueError("The shared detector trains on real DINO features and does not take a predictor initializer")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required; expose GPUs through CUDA_VISIBLE_DEVICES")
     config = deepcopy(config)
+    configured_output = config.get("output_dir")
     resume = str(resolve_path(resume)) if resume else None
     if resume:
         config = resume_config(config, resume, stage)
@@ -129,6 +130,13 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
         config["data"]["batch_size"] = batch_size
     if num_workers is not None:
         config["data"]["num_workers"] = num_workers
+    config["stage"] = stage
+    runtime = config["runtime"]
+    if limit_train_batches is None:
+        limit_train_batches = runtime.get("limit_train_batches", 1.0)
+    if limit_val_batches is None:
+        limit_val_batches = runtime.get("limit_val_batches", 1.0)
+    runtime.update(limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches)
     options = config["optimization"]
     if options.get("max_steps", -1) == 0 or options.get("max_steps", -1) < -1:
         raise ValueError("max_steps must be -1 (unlimited) or positive")
@@ -143,9 +151,17 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
         folder = Path(resume).parent.parent
     elif inherited and "LOCAL_RANK" in os.environ:
         folder = Path(inherited)
+    elif configured_output:
+        folder = resolve_path(configured_output)
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         folder = ROOT / "outputs" / f"{stage}_{stamp}"
+    # Lightning's subprocess ranks inherit this run's directory after rank zero
+    # has written config_train.yaml. Only a fresh invocation checks for reuse.
+    child_rank = inherited == str(folder) and "LOCAL_RANK" in os.environ
+    if not resume and not child_rank and any((folder / name).exists() for name in
+            ("config_train.yaml", "checkpoints/last.ckpt", "checkpoints/best.ckpt")):
+        raise FileExistsError(f"Training output already exists: {folder}; use --resume or a new --output-dir")
     config["output_dir"] = str(folder)
     os.environ["FORESIGHT_TRAIN_OUTPUT"] = str(folder)
     try:
@@ -184,29 +200,14 @@ def run(config, *, stage="detector", resume=None, output_dir=None, max_steps=Non
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--stage", choices=("predictor", "detector"), default="detector")
-    parser.add_argument("--config", help="Defaults to configs/<stage>.yaml")
+    parser.add_argument("--config", required=True, help="YAML training recipe, including stage and output_dir")
     parser.add_argument("--resume", help="Full same-stage checkpoint; restores optimizer and training recipe")
-    parser.add_argument("--predictor-checkpoint", help="Initialize predictor training from a matching v3.1 checkpoint")
-    parser.add_argument("--output-dir")
-    parser.add_argument("--max-steps", type=int, help="Optimizer steps, including steps already completed on resume")
-    parser.add_argument("--epochs", type=int)
-    parser.add_argument("--batch-size", type=int, help="Examples per GPU")
-    parser.add_argument("--num-workers", type=int)
-    parser.add_argument("--limit-train-batches", type=batch_limit, default=1.0)
-    parser.add_argument("--limit-val-batches", type=batch_limit, default=1.0)
+    parser.add_argument("--output-dir", help="Override the configured directory; resume otherwise reuses its run directory")
     args = parser.parse_args(argv)
-    if args.stage == "detector" and args.predictor_checkpoint:
-        parser.error("The shared detector trains on real DINO features and does not take a predictor initializer")
-    if args.resume and args.predictor_checkpoint:
-        parser.error("--resume already restores the Predictor; do not combine it with --predictor-checkpoint")
-    config = load_config(args.config or f"configs/{args.stage}.yaml")
-    if args.predictor_checkpoint:
-        config["model"]["predictor_checkpoint"] = str(resolve_path(args.predictor_checkpoint))
-    return run(config, stage=args.stage, resume=args.resume, output_dir=args.output_dir,
-               max_steps=args.max_steps, epochs=args.epochs, batch_size=args.batch_size,
-               num_workers=args.num_workers, limit_train_batches=args.limit_train_batches,
-               limit_val_batches=args.limit_val_batches)
+    config = load_config(args.config)
+    if config.get("stage") not in ("predictor", "detector"):
+        parser.error("Set stage: predictor or stage: detector in the training config")
+    return run(config, stage=config["stage"], resume=args.resume, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":

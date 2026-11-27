@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 import torch
 
-from .config import load_config, resolve_path
+from .config import load_config
 from .data import CLASSES, HEIGHT, WIDTH, preprocess_rgb
 from .pipeline import load_pipeline, setup_cuda, inference_context
 
@@ -28,48 +28,48 @@ def read_images(paths, expected_count=4):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--config", default="configs/detector.yaml")
-    parser.add_argument("--checkpoint", help="Optional new-project trained Detector checkpoint")
-    parser.add_argument("--predictor-checkpoint", help="Optional new-project trained Predictor")
+    parser.add_argument("--config", required=True)
     parser.add_argument("--images", nargs="+", required=True)
     parser.add_argument("--events", help="Preprocessed history .npy [T,2*bins,H,W], using the training coordinate/bin contract")
-    parser.add_argument("--horizon-steps", type=int, choices=(1,2,3,4), default=1)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--score-threshold", type=float, default=0.)
     args = parser.parse_args(argv)
-    if not math.isfinite(args.score_threshold) or not 0 <= args.score_threshold <= 1:
-        parser.error("score-threshold must lie in [0,1]")
     config = load_config(args.config)
-    if args.predictor_checkpoint:
-        config["model"]["predictor_checkpoint"] = str(resolve_path(args.predictor_checkpoint))
+    options = config.get("inference", {})
+    horizon_steps = options.get("horizon_steps", 1)
+    score_threshold = options.get("score_threshold", 0.0)
+    if type(horizon_steps) is not int or horizon_steps not in (1, 2, 3, 4):
+        parser.error("inference.horizon_steps must be 1, 2, 3 or 4")
+    if (type(score_threshold) not in (int, float) or not math.isfinite(score_threshold)
+            or not 0 <= score_threshold <= 1):
+        parser.error("inference.score_threshold must lie in [0,1]")
+    # Input/output files supplied on the CLI follow the shell cwd.
     paths = [Path(value).expanduser().resolve() for value in args.images]
     output = Path(args.output).expanduser().resolve()
+    events_path = Path(args.events).expanduser().resolve() if args.events else None
     protected = paths + [Path(v).resolve() for v in config["model"].values() if isinstance(v, str)]
-    if args.checkpoint:
-        protected.append(resolve_path(args.checkpoint))
-    if args.events:
-        protected.append(resolve_path(args.events))
+    if events_path is not None:
+        protected.append(events_path)
     if output in protected:
         parser.error("Output must differ from input images and model assets")
     images = read_images(paths, config["data"]["context_frames"])
     device = setup_cuda(config)
-    pipeline = load_pipeline(config, resolve_path(args.checkpoint) if args.checkpoint else None).to(device)
+    pipeline = load_pipeline(config).to(device)
     history = torch.stack([preprocess_rgb(image, config["data"]["image_size"]) for image in images])[None].to(device)
     events = None
-    if args.events:
-        raw = np.load(resolve_path(args.events), allow_pickle=False)
+    if events_path is not None:
+        raw = np.load(events_path, allow_pickle=False)
         if raw.ndim != 4 or raw.shape[0] != len(images) or not np.isfinite(raw).all() or (raw < 0).any():
             raise ValueError("Events must be finite, nonnegative [T,2*bins,H,W] log-count features")
         events = torch.from_numpy(raw).float()[None].to(device)
     with torch.inference_mode(), inference_context(config):
-        prediction = pipeline.predict(history, events, horizon_steps=args.horizon_steps)[0]
+        prediction = pipeline.predict(history, events, horizon_steps=horizon_steps)[0]
     detections = []
     for box, label, score in zip(prediction["boxes"].float().cpu().tolist(),
                                  prediction["labels"].cpu().tolist(),
                                  prediction["scores"].float().cpu().tolist()):
-        if score >= args.score_threshold:
+        if score >= score_threshold:
             detections.append(dict(box_xyxy=box, label=label, class_name=CLASSES[label], score=score))
-    result = dict(history_images=list(map(str, paths)), prediction_ms=50*args.horizon_steps,
+    result = dict(history_images=list(map(str, paths)), prediction_ms=50*horizon_steps,
                   assumed_history_interval_ms=50, original_image_size=[HEIGHT, WIDTH],
                   model_image_size=config["data"]["image_size"],
                   coordinate_format="xyxy in original image pixels", detections=detections)

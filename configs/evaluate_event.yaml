@@ -1,0 +1,7 @@
+# M2 evaluation and image inference with the shared detection head.
+extends: event_predictor.yaml
+model:
+  rgb_checkpoint: null
+  predictor_checkpoint: outputs/v31_m2/checkpoints/best.ckpt
+evaluation:
+  output: outputs/v31_m2_val.json

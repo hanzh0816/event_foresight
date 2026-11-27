@@ -33,7 +33,7 @@ def load_config(filename, _seen=None):
             return result
         config = merge(base, config)
     config = deepcopy(config)
-    for section in ("data", "model", "optimization", "runtime"):
+    for section in ("data", "model", "optimization", "runtime", "evaluation", "inference", "resume_overrides"):
         if section not in config:
             config[section] = {}
         if not isinstance(config[section], dict):
@@ -44,8 +44,29 @@ def load_config(filename, _seen=None):
                            frame_interval_s=0.05, batch_size=1, num_workers=4).items():
         data.setdefault(key, value)
     for key, value in dict(seed=42, precision="bf16-mixed", encoder_chunk_size=1,
-                           cpu_threads=4, log_every=10).items():
+                           cpu_threads=4, log_every=10,
+                           limit_train_batches=1.0, limit_val_batches=1.0).items():
         runtime.setdefault(key, value)
+    if "stage" in config and config["stage"] not in ("predictor", "detector"):
+        raise ValueError("stage must be predictor or detector")
+    for key, minimum in (("batch_size", 1), ("num_workers", 0)):
+        if type(data[key]) is not int or data[key] < minimum:
+            raise ValueError(f"data.{key} must be an integer >= {minimum}")
+    for key in ("limit_train_batches", "limit_val_batches"):
+        value = runtime[key]
+        if not ((type(value) is int and value >= 0)
+                or (type(value) is float and 0 <= value <= 1)):
+            raise ValueError(f"runtime.{key} must be a nonnegative batch count or a float in [0,1]")
+    overrides = config["resume_overrides"]
+    if overrides.keys() - {"epochs", "max_steps"}:
+        raise ValueError("resume_overrides only supports epochs and max_steps")
+    for section in (config["optimization"], overrides):
+        for key in ("epochs", "max_steps", "accumulation_steps"):
+            if key not in section:
+                continue
+            value = section[key]
+            if type(value) is not int or not (value > 0 or (key in ("epochs", "max_steps") and value == -1)):
+                raise ValueError(f"{key} must be positive" + (" or -1" if key in ("epochs", "max_steps") else ""))
     size = data["image_size"]
     if (not isinstance(size, (list, tuple)) or len(size) != 2
             or any(type(x) is not int or x < 14 or x % 14 for x in size)):
@@ -62,7 +83,9 @@ def load_config(filename, _seen=None):
     if runtime["precision"] not in ("bf16-mixed", "32-true"):
         raise ValueError("precision must be bf16-mixed or 32-true")
     for container, keys in ((data, ("root",)),
-                            (model, ("encoder_checkpoint", "predictor_checkpoint", "rgb_checkpoint", "detector_checkpoint"))):
+                            (model, ("encoder_checkpoint", "predictor_checkpoint", "rgb_checkpoint", "detector_checkpoint")),
+                            (config, ("output_dir",)),
+                            (config["evaluation"], ("manifest", "output"))):
         for key in keys:
             if container.get(key):
                 container[key] = str(resolve_path(container[key]))

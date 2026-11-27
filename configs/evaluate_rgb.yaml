@@ -1,0 +1,7 @@
+# B1 evaluation and image inference with the shared detection head.
+extends: predictor.yaml
+model:
+  rgb_checkpoint: null
+  predictor_checkpoint: outputs/v31_b1/checkpoints/best.ckpt
+evaluation:
+  output: outputs/v31_b1_val.json
