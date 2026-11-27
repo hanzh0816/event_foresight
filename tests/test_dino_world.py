@@ -8,8 +8,10 @@ import pytest
 import torch
 from torch import nn
 
-import foresight.models.dino_world as dino_world
-from foresight.models.dino_world import DINOWorldForecaster, DINOWorldPredictor, apply_rope_3d
+from foresight.models import forecaster
+from foresight.models.forecaster import DINOWorldForecaster
+from foresight.models.predictor import DINOWorldPredictor, PREDICTOR_DEFAULTS
+from foresight.models.attention import apply_rope_3d
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +209,7 @@ def test_invalid_or_causally_empty_timestamps_are_rejected(context_times, query_
 
 
 def test_model_source_does_not_download_weights_or_use_hub():
-    source = Path(dino_world.__file__).read_text()
+    source = Path(forecaster.__file__).read_text()
     assert 'torch.hub.' not in source
     assert 'load_state_dict_from_url' not in source
 
@@ -236,7 +238,7 @@ def tiny_forecaster(checkpoint):
 
 
 def test_forecaster_strictly_loads_frozen_last_layer_tokens_without_pca(tmp_path, monkeypatch):
-    monkeypatch.setattr(dino_world, 'vit_base', TinyBackbone)
+    monkeypatch.setattr(forecaster, 'vit_base', TinyBackbone)
     path = tmp_path / 'encoder.pth'
     state = TinyBackbone().state_dict()
     state['scale'].add_(.125)
@@ -268,7 +270,7 @@ def test_forecaster_strictly_loads_frozen_last_layer_tokens_without_pca(tmp_path
 
 @pytest.mark.parametrize('corruption', ['missing', 'unexpected', 'wrong_shape', 'nonfinite', 'wrapped'])
 def test_encoder_checkpoint_rejects_incompatible_or_corrupt_weights(tmp_path, monkeypatch, corruption):
-    monkeypatch.setattr(dino_world, 'vit_base', TinyBackbone)
+    monkeypatch.setattr(forecaster, 'vit_base', TinyBackbone)
     state = TinyBackbone().state_dict()
     if corruption == 'missing':
         del state['scale']
@@ -287,9 +289,9 @@ def test_encoder_checkpoint_rejects_incompatible_or_corrupt_weights(tmp_path, mo
 
 
 def test_v31_defaults_and_optional_event_layer_selection():
-    assert dino_world.PREDICTOR_DEFAULTS['depth'] == 8
-    assert dino_world.PREDICTOR_DEFAULTS['hidden_dim'] == 768
-    assert dino_world.PREDICTOR_DEFAULTS['heads'] == 12
+    assert PREDICTOR_DEFAULTS['depth'] == 8
+    assert PREDICTOR_DEFAULTS['hidden_dim'] == 768
+    assert PREDICTOR_DEFAULTS['heads'] == 12
     predictor = small_predictor(event_enabled=True, depth=4, event_layers=[2, 4])
     assert [b.event_attention is not None for b in predictor.blocks] == [False, True, False, True]
     assert predictor.architecture['event_layers'] == [2, 4]
@@ -497,7 +499,7 @@ class TinyGridBackbone(TinyBackbone):
 
 
 def test_forecaster_integrates_rvt_and_only_freezes_rgb_encoder(tmp_path, monkeypatch):
-    monkeypatch.setattr(dino_world, 'vit_base', TinyGridBackbone)
+    monkeypatch.setattr(forecaster, 'vit_base', TinyGridBackbone)
     path = tmp_path / 'encoder.pth'
     torch.save(TinyGridBackbone().state_dict(), path)
     model = DINOWorldForecaster(

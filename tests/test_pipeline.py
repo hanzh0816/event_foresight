@@ -7,9 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from foresight import pipeline
-from foresight.checkpoints import TRAINING_FORMAT, input_spec
-from foresight.models.detector import FutureDetector
+from foresight.inference import pipeline
+from foresight.models.checkpoints import TRAINING_FORMAT, input_spec
+from foresight.models.detection.detector import FutureDetector
 
 
 class TinyForecaster(nn.Module):

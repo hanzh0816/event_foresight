@@ -5,9 +5,9 @@ from contextlib import nullcontext
 import torch
 from torch import nn
 
-from .checkpoints import load_predictor, load_shared_detector
-from .models.dino_world import DINOWorldForecaster
-from .models.detector import postprocess
+from ..models.checkpoints import load_predictor, load_shared_detector
+from ..models.forecaster import DINOWorldForecaster
+from ..models.detection import postprocess
 
 
 class ForecastDetector(nn.Module):

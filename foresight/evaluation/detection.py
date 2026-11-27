@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .data.definitions import CLASSES, HEIGHT, WIDTH, require_int
+from ..data.definitions import CLASSES, HEIGHT, WIDTH, require_int
 
 
 @dataclass

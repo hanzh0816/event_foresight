@@ -12,9 +12,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from foresight.checkpoints import TRAINING_FORMAT, load_predictor, load_rgb_initializer
-from foresight.losses import event_alignment_loss
-from foresight.models.dino_world import DINOWorldPredictor
+from foresight.models.checkpoints import TRAINING_FORMAT, load_predictor, load_rgb_initializer
+from foresight.training.losses import event_alignment_loss
+from foresight.models.predictor import DINOWorldPredictor
 from foresight.training import PredictorTask
 
 

@@ -118,7 +118,7 @@ def load_rgb_initializer(forecaster, filename):
 
 
 def load_shared_detector(filename, forecaster):
-    from .models.detector import FutureDetector
+    from .detection import FutureDetector
     saved = read_checkpoint(filename)
     if saved.get("foresight_format") != TRAINING_FORMAT or saved.get("stage") != "detector":
         raise ValueError("detector_checkpoint must be a v3.1 shared detection head")

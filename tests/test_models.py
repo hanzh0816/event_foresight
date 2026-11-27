@@ -5,8 +5,8 @@ import importlib
 import pytest
 import torch
 
-from foresight.models.criterion import DetectionCriterion
-from foresight.models.detector import FutureDetector, postprocess
+from foresight.models.detection.criterion import DetectionCriterion
+from foresight.models.detection.detector import FutureDetector, postprocess
 
 
 @pytest.fixture(autouse=True)

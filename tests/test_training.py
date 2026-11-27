@@ -11,8 +11,8 @@ from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
 from foresight.training import CHECKPOINT_FORMAT, DetectorTask, PredictorTask
-from foresight.samplers import ValidationSampler
-from foresight.train import make_trainer, resume_config, ValidateAtStepBudget
+from foresight.data.samplers import ValidationSampler
+from foresight.training.runner import make_trainer, resume_config, ValidateAtStepBudget
 
 
 class TinyPredictor(nn.Module):
@@ -201,8 +201,8 @@ def test_validation_sampler_no_duplicates_and_empty_rank_placeholder():
 
 
 def test_trainer_uses_all_visible_gpus_and_configured_batch_limits(monkeypatch, tmp_path):
-    monkeypatch.setattr("foresight.train.torch.cuda.device_count", lambda: 2)
-    monkeypatch.setattr("foresight.train.Trainer", lambda **kwargs: kwargs)
+    monkeypatch.setattr("foresight.training.runner.torch.cuda.device_count", lambda: 2)
+    monkeypatch.setattr("foresight.training.runner.Trainer", lambda **kwargs: kwargs)
     cfg = config(tmp_path)
     cfg["runtime"].update(limit_train_batches=2, limit_val_batches=0)
     kwargs = make_trainer(cfg, "predictor")
@@ -224,7 +224,7 @@ def test_resume_recipe_preserves_budget_and_selection(monkeypatch, tmp_path):
     saved_config["optimization"]["lr"] = 2e-5
     saved_config["runtime"].update(seed=123, precision="bf16-mixed", encoder_chunk_size=2)
     saved_config["model"]["predictor_checkpoint"] = "/old/missing/init.ckpt"
-    monkeypatch.setattr("foresight.checkpoints.read_checkpoint", lambda path: {
+    monkeypatch.setattr("foresight.models.checkpoints.read_checkpoint", lambda path: {
         "foresight_format": CHECKPOINT_FORMAT, "stage": "predictor", "config": saved_config})
     current = config(tmp_path)
     current["data"]["root"] = "/new/data"
@@ -250,7 +250,7 @@ def test_scratch_detector_architecture_is_saved_and_restored(tmp_path, monkeypat
     architecture = payload["detector_architecture"]
     assert architecture["feature_dim"] == 2 and architecture["grid_size"] == [1, 1]
     assert architecture["hidden_dim"] == 8
-    monkeypatch.setattr("foresight.checkpoints.read_checkpoint", lambda path: payload)
+    monkeypatch.setattr("foresight.models.checkpoints.read_checkpoint", lambda path: payload)
     restored_config = resume_config(config(tmp_path), "unused.ckpt", "detector")
     assert restored_config["detector"]["hidden_dim"] == 8
     restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion())
@@ -297,7 +297,7 @@ def test_cosine_schedule_uses_five_percent_warmup_and_absolute_minimum(tmp_path,
         [2e-4, 4e-4, 6e-4, 8e-4, 1e-3])
     assert base_lr * schedule(99) == pytest.approx(1e-6)
     assert schedule(5) > schedule(50) > schedule(98)
-    monkeypatch.setattr("foresight.train.Trainer", lambda **kwargs: kwargs)
+    monkeypatch.setattr("foresight.training.runner.Trainer", lambda **kwargs: kwargs)
     trainer = make_trainer(cfg, "predictor")
     callback = next(callback for callback in trainer["callbacks"] if isinstance(callback, ModelCheckpoint))
     assert callback.monitor == "val_feature_loss" and callback.mode == "min"
@@ -370,7 +370,7 @@ def test_train_cli_uses_configured_stage_and_initializer(tmp_path, monkeypatch):
 def test_shared_head_enables_ap_selection_and_separate_foreground_checkpoint(tmp_path, monkeypatch):
     cfg = config(tmp_path)
     cfg['model']['detector_checkpoint'] = str(tmp_path / 'shared-head.ckpt')
-    monkeypatch.setattr('foresight.train.Trainer', lambda **kwargs: kwargs)
+    monkeypatch.setattr('foresight.training.runner.Trainer', lambda **kwargs: kwargs)
     trainer = make_trainer(cfg, 'predictor')
     checkpoints = [callback for callback in trainer['callbacks'] if isinstance(callback, ModelCheckpoint)]
     ap = next(callback for callback in checkpoints if callback.monitor == 'val_AP')
@@ -380,7 +380,7 @@ def test_shared_head_enables_ap_selection_and_separate_foreground_checkpoint(tmp
 
 
 def test_predictor_resume_restores_embedded_head_without_external_checkpoint(tmp_path, monkeypatch):
-    from foresight.models.detector import FutureDetector
+    from foresight.models.detection.detector import FutureDetector
 
     source = PredictorTask(config(tmp_path), forecaster=TinyForecaster())
     source.detector = FutureDetector(feature_dim=2, grid_size=(1, 1), hidden_dim=8,
@@ -400,7 +400,7 @@ def test_predictor_resume_restores_embedded_head_without_external_checkpoint(tmp
     def external_head_forbidden(*args, **kwargs):
         raise AssertionError('Full resume must use its embedded validation head')
 
-    monkeypatch.setattr('foresight.checkpoints.load_shared_detector', external_head_forbidden)
+    monkeypatch.setattr('foresight.models.checkpoints.load_shared_detector', external_head_forbidden)
     restored = PredictorTask(restored_config, forecaster=TinyForecaster())
     restored.on_load_checkpoint(payload)
     restored.load_state_dict(payload['state_dict'], strict=True)

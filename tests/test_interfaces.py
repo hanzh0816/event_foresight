@@ -11,9 +11,9 @@ import pytest
 import torch
 from torch import nn
 
-from foresight.checkpoints import load_predictor, TRAINING_FORMAT
+from foresight.models.checkpoints import load_predictor, TRAINING_FORMAT
 from foresight.config import ROOT, load_config
-from foresight.evaluate import read_sample_ids
+from foresight.evaluation.runner import read_sample_ids
 
 
 def test_imports_from_unrelated_directory_without_unused_dependencies(tmp_path):

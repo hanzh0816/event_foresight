@@ -12,7 +12,7 @@ from torch import nn
 
 from .geometry import normalize_hw
 
-from .attention import MultiScaleDeformableAttention
+from .deformable_attention import MultiScaleDeformableAttention
 from .boxes import box_cxcywh_to_xyxy
 
 

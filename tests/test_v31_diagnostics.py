@@ -7,8 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from foresight.diagnostics import mismatched_donors, motion_subset
-from foresight.pipeline import ForecastDetector
+from foresight.evaluation.diagnostics import mismatched_donors, motion_subset
+from foresight.inference.pipeline import ForecastDetector
 
 
 class DonorInventory:

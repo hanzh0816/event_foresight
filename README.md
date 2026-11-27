@@ -57,8 +57,8 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.evaluate \
 
 ## 文件入口
 
-- [模型与服务器交接说明](docs/v31.md)：结构、配置、因果边界、恢复与待验证项目。
+- [模型与服务器交接说明](docs/v31.md)：结构、配置、因果边界、恢复与待验证项目；模块位置见[代码结构](docs/v31.md#代码结构与来源)。
 - [Event 表征调研](docs/event-representation-survey.md)：相关文献。
-- [上游来源](foresight/vendor/SOURCES.json)、[检测模块许可证](foresight/models/APACHE-LICENSE)：保留的第三方代码来源与许可。
+- [上游来源](foresight/vendor/SOURCES.json)、[检测模块许可证](foresight/models/detection/APACHE-LICENSE)：保留的第三方代码来源与许可。
 
 权重、数据和 `outputs/` 不提交到 Git。
