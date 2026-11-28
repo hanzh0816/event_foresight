@@ -40,7 +40,8 @@ model:
 optimization:
   epochs: 40
   max_steps: -1
-  accumulation_steps: 8
+  # Disabled by default; increase manually only if memory limits the per-GPU batch.
+  accumulation_steps: 1
   lr: 0.0001
   event_lr: 0.0002
   finetune_lr: 0.00002

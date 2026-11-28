@@ -6,6 +6,7 @@ import inspect
 import torch
 
 from .base import _ForecastTask, _detection_report
+from .monitoring import log_training_losses
 
 
 class DetectorTask(_ForecastTask):
@@ -68,8 +69,8 @@ class DetectorTask(_ForecastTask):
     def training_step(self, batch, batch_idx):
         losses = self.criterion(self(batch["future_rgb_target"]), batch["targets"], sync_num_boxes=True)
         batch_size = len(batch["history_rgb"])
-        self.log_dict({f"train_{key}": value for key, value in losses.items()}, on_step=True,
-                      on_epoch=True, sync_dist=True, batch_size=batch_size)
+        log_training_losses(self, {f"train_{key}": value for key, value in losses.items()},
+                            batch_size=batch_size)
         return self._training_loss(losses["loss"], batch_size)
 
     def on_validation_epoch_start(self):

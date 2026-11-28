@@ -10,6 +10,20 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 
 
+def log_training_losses(task, metrics, *, batch_size, progress_metric=None):
+    """Log local step values and sample-weighted epoch means across all ranks.
+
+    Every rank contributes every microbatch to the epoch mean. Only the epoch
+    computation synchronizes; the rank-zero logger writes its local step value.
+    """
+    for name, value in metrics.items():
+        value = value.detach()
+        task.log(f"{name}_step", value, on_step=True, on_epoch=False,
+                 sync_dist=False, batch_size=batch_size, prog_bar=name == progress_metric)
+        task.log(f"{name}_epoch", value, on_step=False, on_epoch=True,
+                 sync_dist=True, batch_size=batch_size)
+
+
 def tensorboard_tag(name):
     """Group presentation tags without changing Lightning/CSV metric names."""
     core = {
@@ -56,7 +70,7 @@ def tensorboard_tag(name):
 def overview_layout(stage):
     """Reuse scalar tags in a small Custom Scalars dashboard."""
     charts = {
-        "Training total loss (sampled microbatch)": ["Multiline", ["^monitor/train/total_loss_step$"]],
+        "Training total loss (rank 0 microbatch)": ["Multiline", ["^monitor/train/total_loss_step$"]],
         "Total objective (epoch)": ["Multiline", ["^monitor/train/total_loss_epoch$"]],
         "Learning rates": ["Multiline", ["^monitor/lr/.*$"]],
         "Validation AP": ["Multiline", ["^monitor/val/AP$"]],
@@ -89,8 +103,8 @@ def validation_scalars(report):
     """Retain checkpoint monitor aliases; absent class AP stays absent, not zero."""
     scalars = {}
     for name, value in report["metrics"].items():
-        if value is None or name == "next_frame_smooth_l1":
-            continue  # This legacy alias duplicates prediction_loss in the JSON report.
+        if value is None:
+            continue
         key = "val_feature_loss" if name == "prediction_loss" else f"val_{name}"
         scalars[key] = float(value)
     for label, metrics in report.get("per_class", {}).items():

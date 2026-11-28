@@ -8,6 +8,7 @@ from torch import distributed as dist
 from torch.nn import functional as F
 
 from .base import _ForecastTask, _detection_report, _distributed
+from .monitoring import log_training_losses
 
 
 class PredictorTask(_ForecastTask):
@@ -93,9 +94,10 @@ class PredictorTask(_ForecastTask):
         if "future_rgb_target" not in batch:
             raise ValueError("Predictor training requires a separate future_rgb_target")
         history = self._encode_history(batch["history_rgb"])
-        prediction, event_features = self._predict(history, batch.get("history_events"))
         with torch.no_grad():
             future = self.forecaster.encode_latents(batch["future_rgb_target"])
+        prediction, event_features = self._predict(history, batch.get("history_events"))
+        with torch.no_grad():
             target = torch.cat((history[:, 1:], future[:, None]), dim=1)
         if prediction.shape != target.shape:
             raise ValueError("Predicted and teacher next-frame latent shapes differ")
@@ -122,8 +124,8 @@ class PredictorTask(_ForecastTask):
     def training_step(self, batch, batch_idx):
         losses, _, _ = self.feature_outputs(batch)
         batch_size = len(batch["history_rgb"])
-        self.log_dict({f"train_{key}_loss": value for key, value in losses.items()},
-                      on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
+        log_training_losses(self, {f"train_{key}_loss": value for key, value in losses.items()},
+                            batch_size=batch_size, progress_metric="train_total_loss")
         return self._training_loss(losses["total"], batch_size)
 
     def on_validation_epoch_start(self):
@@ -160,7 +162,6 @@ class PredictorTask(_ForecastTask):
             raise RuntimeError("No validation samples were evaluated")
         values = self.validation_totals[:3].tolist()
         metrics = {f"{key}_loss": value/count for key,value in zip(("prediction", "alignment", "total"),values)}
-        metrics["next_frame_smooth_l1"] = metrics["prediction_loss"]
         for name, totals in zip(("all", "foreground", "background"), self.region_totals.tolist()):
             l1, cosine, patches = totals
             if patches:

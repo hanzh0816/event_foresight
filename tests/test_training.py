@@ -91,13 +91,23 @@ class TinyPredictorTask(PredictorTask):
         return DataLoader([sample(i) for i in range(6)], batch_size=2, shuffle=False)
 
 
-def test_predictor_uses_history_only_and_freezes_teacher(tmp_path):
+def test_predictor_uses_history_only_and_freezes_teacher(tmp_path, monkeypatch):
     forecaster = TinyForecaster()
     task = PredictorTask(config(tmp_path), forecaster=forecaster)
     task.train()
     batch = next(iter(DataLoader([sample(1), sample(2)], batch_size=2)))
     prediction = task(batch["history_rgb"])
-    loss = task.feature_loss(batch)
+    original_predict = task._predict
+
+    def predict_after_teacher(history, events=None):
+        assert torch.equal(forecaster.seen[-2], batch["history_rgb"].flatten(0, 1))
+        assert torch.equal(forecaster.seen[-1], batch["future_rgb_target"])
+        assert not history.requires_grad
+        return original_predict(history, events)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(task, "_predict", predict_after_teacher)
+        loss = task.feature_loss(batch)
     loss.backward()
     assert loss.dtype == torch.float32
     assert all(p.grad is None and not p.requires_grad for p in forecaster.encoder.parameters())
