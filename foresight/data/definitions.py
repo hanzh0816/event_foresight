@@ -67,7 +67,6 @@ class Frame:
     frame_index: int
     timestamp_us: int
     image: np.ndarray
-    exposure_us: tuple[int, int] | None = None
 
 
 @dataclass

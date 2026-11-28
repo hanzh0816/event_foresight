@@ -16,8 +16,6 @@ class RGBSequenceReader:
         self.label_starts = np.searchsorted(track_times, self.timestamps, side="left")
         self.label_ends = np.searchsorted(track_times, self.timestamps, side="right")
         self.image_files = [self.image_dir / f"{i:06d}.png" for i in range(len(self.timestamps))]
-        exposure = self.path / "images/left/exposure_timestamps.txt"
-        self.exposures = np.loadtxt(exposure, dtype=np.int64, delimiter=",", ndmin=2) if exposure.exists() else None
 
     def __len__(self):
         return len(self.timestamps)
@@ -32,8 +30,7 @@ class RGBSequenceReader:
         index = self._frame_index(index)
         with Image.open(self.image_files[index]) as image:
             pixels = np.array(image.convert("RGB"))
-        exposure = tuple(map(int, self.exposures[index])) if self.exposures is not None else None
-        return Frame(index, int(self.timestamps[index]), pixels, exposure)
+        return Frame(index, int(self.timestamps[index]), pixels)
 
     def read_tracks(self, index):
         index = self._frame_index(index)

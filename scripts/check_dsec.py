@@ -14,6 +14,8 @@ from PIL import Image
 from foresight.config import resolve_path
 from foresight.data import CLASSES, DEFAULT_SPLITS, HEIGHT, WIDTH, RGBDataset, RGBSequenceReader
 
+EVENT_WINDOW_US = 50000
+
 
 def require(condition, message):
     if not condition:
@@ -37,11 +39,6 @@ def check_metadata(reader):
     require(np.isin(tracks["t"], times).all(), "tracks.npy timestamps do not match RGB timestamps")
     require(np.isin(tracks["class_id"], np.arange(len(CLASSES))).all(),
             "tracks.npy class_id must be in [0, 7]")
-    if reader.exposures is not None:
-        require(reader.exposures.shape == (len(times), 2),
-                "exposure_timestamps.txt must contain one start,end row per RGB frame")
-        require(np.all(reader.exposures[:, 1] >= reader.exposures[:, 0]),
-                "exposure_timestamps.txt contains end < start")
 
 
 def check_images(reader, windows, deep, errors):
@@ -64,8 +61,7 @@ def check_images(reader, windows, deep, errors):
             errors.append(f"Cannot decode {path}: {exc}")
 
 
-def check_events(path, reader, windows, *, deep, event_window_us,
-                 event_endpoint="rgb_timestamp"):
+def check_events(path, reader, windows, *, deep):
     from foresight.data.event_reader import EventStream, H5HandleCache
 
     cache = H5HandleCache(max_open=1)
@@ -96,21 +92,14 @@ def check_events(path, reader, windows, *, deep, event_window_us,
         # Check coverage and causality for EVERY usable window, without loading event payloads.
         ends = np.array([end for _, end in windows], dtype=np.int64)
         history = ends[:, None] + np.arange(-3, 1)
-        if event_endpoint == "rgb_timestamp":
-            stops = reader.timestamps[history]
-        elif event_endpoint == "exposure_end":
-            require(reader.exposures is not None,
-                    f"{path}: exposure_end checks require images/left/exposure_timestamps.txt")
-            stops = reader.exposures[history, 1]
-        else:
-            raise ValueError("event_endpoint must be rgb_timestamp or exposure_end")
-        invalid = np.any((stops - event_window_us < first) | (stops > last), axis=1)
+        stops = reader.timestamps[history]
+        invalid = np.any((stops - EVENT_WINDOW_US < first) | (stops > last), axis=1)
         require(not invalid.any(),
                 f"{path}: event coverage insufficient for {int(invalid.sum())} windows "
-                f"(window_us={event_window_us}, endpoint={event_endpoint}, available=[{first}, {last}])")
+                f"(window_us={EVENT_WINDOW_US}, endpoint=rgb_timestamp, available=[{first}, {last}])")
         require(np.all(stops <= stops[:, -1:]), f"{path}: historical event endpoint exceeds input cutoff")
         require(np.all(reader.timestamps[ends + 1] > stops[:, -1]),
-                f"{path}: future target must follow the {event_endpoint} input cutoff")
+                f"{path}: future target must follow the RGB timestamp input cutoff")
 
         # Read compressed payloads; --deep scans all chunks with bounded memory.
         chunk = 1_000_000 if deep else 4096
@@ -142,7 +131,7 @@ def check_events(path, reader, windows, *, deep, event_window_us,
         # Exercise the real indexed reader at the beginning, middle and end of the inventory.
         for i in probe_indices(len(windows)):
             for stop in stops[i]:
-                start, stop = int(stop) - event_window_us, int(stop)
+                start, stop = int(stop) - EVENT_WINDOW_US, int(stop)
                 for time, index in zip((start, stop), stream.event_indices(start, stop)):
                     local = time - first
                     require((index == count or int(handle["events/t"][index]) >= local) and
@@ -154,15 +143,12 @@ def check_events(path, reader, windows, *, deep, event_window_us,
         cache.close()
 
 
-def check_sequence(root, split, name, *, rgb_only, deep, event_window_us,
-                   event_endpoint="rgb_timestamp"):
+def check_sequence(root, split, name, *, rgb_only, deep):
     path = root / ("test" if split == "test" else "train") / name
     result = dict(name=name, path=str(path), frames=0, windows=0, events=0, errors=[])
     required = ["images/timestamps.txt", "object_detections/left/tracks.npy"]
     if not rgb_only:
         required.append("events/left/events.h5")
-        if event_endpoint == "exposure_end":
-            required.append("images/left/exposure_timestamps.txt")
     for relative in required:
         file = path / relative
         try:
@@ -184,28 +170,21 @@ def check_sequence(root, split, name, *, rgb_only, deep, event_window_us,
             require(bool(windows), "No usable labeled 40-frame-history/next-frame windows")
             if not rgb_only:
                 result["events"] = check_events(path / "events/left/events.h5", reader, windows,
-                                                deep=deep, event_window_us=event_window_us,
-                                                event_endpoint=event_endpoint)
+                                                deep=deep)
     except Exception as exc:
         result["errors"].append(f"{type(exc).__name__}: {exc}")
     return result
 
 
-def check_dsec(root, *, rgb_only=False, deep=False, event_window_us=50000,
-               event_endpoint="rgb_timestamp"):
-    require(event_window_us in (50000, 200000), "event_window_us must be 50000 or 200000")
-    require(event_endpoint in ("rgb_timestamp", "exposure_end"),
-            "event_endpoint must be rgb_timestamp or exposure_end")
+def check_dsec(root, *, rgb_only=False, deep=False):
     root = resolve_path(root)
     report = dict(root=str(root), mode="rgb" if rgb_only else "rgb+event", deep=deep,
-                  event_window_us=event_window_us, event_endpoint=event_endpoint,
-                  v31_event_protocol=not rgb_only and event_window_us == 50000 and event_endpoint == "rgb_timestamp",
+                  event_window_us=EVENT_WINDOW_US, event_endpoint="rgb_timestamp",
                   splits={})
     for split, names in DEFAULT_SPLITS.items():
         rows = []
         for name in names:
-            row = check_sequence(root, split, name, rgb_only=rgb_only, deep=deep,
-                                 event_window_us=event_window_us, event_endpoint=event_endpoint)
+            row = check_sequence(root, split, name, rgb_only=rgb_only, deep=deep)
             rows.append(row)
             print(f"[{'FAIL' if row['errors'] else 'OK'}] {split}/{name}: "
                   f"frames={row['frames']} windows={row['windows']}", flush=True)
@@ -226,11 +205,7 @@ def check_dsec(root, *, rgb_only=False, deep=False, event_window_us=50000,
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--data-root", required=True, help="DSEC root containing train/ and test/")
-    parser.add_argument("--rgb-only", action="store_true", help="Do not require event streams; validate exposure metadata only if present")
-    parser.add_argument("--event-window-us", type=int, choices=(50000, 200000), default=50000,
-                        help="50000 for v3.1; 200000 is a separate legacy coverage check")
-    parser.add_argument("--event-endpoint", choices=("rgb_timestamp", "exposure_end"), default="rgb_timestamp",
-                        help="v3.1 uses RGB timestamps; exposure_end checks the legacy exposure-based protocol")
+    parser.add_argument("--rgb-only", action="store_true", help="Check RGB and annotations without requiring event streams")
     parser.add_argument("--deep", action="store_true", help="Decode all PNGs and scan all event chunks (slow)")
     parser.add_argument("--output", help="Optional JSON report path outside DSEC (overwrites an existing report)")
     args = parser.parse_args(argv)
@@ -238,8 +213,7 @@ def main(argv=None):
     root = resolve_path(args.data_root)
     if output and output.is_relative_to(root):
         parser.error("--output must be outside the DSEC root")
-    report = check_dsec(root, rgb_only=args.rgb_only, deep=args.deep, event_window_us=args.event_window_us,
-                        event_endpoint=args.event_endpoint)
+    report = check_dsec(root, rgb_only=args.rgb_only, deep=args.deep)
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w") as handle:

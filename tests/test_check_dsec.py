@@ -62,14 +62,10 @@ def errors_for(report, split):
                      for error in seq["errors"])
 
 
-@pytest.mark.parametrize("event_window_us,deep,event_endpoint", [
-    (50_000, False, "rgb_timestamp"), (200_000, False, "rgb_timestamp"),
-    (50_000, True, "rgb_timestamp"), (200_000, False, "exposure_end"),
-])
-def test_complete_inventory_passes_all_stages(complete_dsec, event_window_us, deep, event_endpoint):
+@pytest.mark.parametrize("deep", [False, True])
+def test_complete_inventory_passes_all_stages(complete_dsec, deep):
     root, paths, _, _ = complete_dsec
-    report = check_dsec.check_dsec(root, event_window_us=event_window_us, deep=deep,
-                                  event_endpoint=event_endpoint)
+    report = check_dsec.check_dsec(root, deep=deep)
     assert report["passed"], report
     assert report["stages"] == {"train": True, "eval": True, "test": True}
     assert not (root / "val").exists()
@@ -137,31 +133,27 @@ def test_rgb_only_does_not_require_events_or_exposure(complete_dsec):
     assert not check_dsec.check_dsec(root)["passed"]
 
 
-def test_timestamp_protocol_accepts_missing_exposures_but_legacy_requires_them(complete_dsec):
+def test_timestamp_protocol_accepts_missing_exposures(complete_dsec):
     root, paths, _, _ = complete_dsec
     for path in paths.values():
         (path / "images/left/exposure_timestamps.txt").unlink()
     report = check_dsec.check_dsec(root)
     assert report["passed"], report
     assert report["event_endpoint"] == "rgb_timestamp"
-    assert report["v31_event_protocol"]
-    legacy = check_dsec.check_dsec(root, event_endpoint="exposure_end")
-    assert not legacy["passed"]
-    assert not legacy["v31_event_protocol"]
-    assert "exposure_timestamps.txt" in errors_for(legacy, "train")
+    assert report["event_window_us"] == 50000
 
 
 @pytest.mark.parametrize("boundary", ["first_start", "last_stop"])
-def test_coverage_uses_rgb_timestamp_or_explicit_exposure_endpoint(complete_dsec, boundary):
+def test_coverage_uses_rgb_timestamp_boundaries(complete_dsec, boundary):
     root, paths, times, _ = complete_dsec
     with h5py.File(paths["train"] / "events/left/events.h5", "r+") as handle:
         if boundary == "first_start":
             # The first context is frame 36: its timestamp-based window starts
-            # at frame 35, 2.5 ms before coverage; exposure_end is 5 ms later.
+            # at frame 35, 2.5 ms before coverage.
             handle["t_offset"][()] = int(times[35]) + 2500
         else:
             # Coverage ends exactly at the final observed RGB timestamp.
-            # The half-open timestamp window fits, but exposure_end is later.
+            # The half-open timestamp window fits exactly.
             last_local = int(times[43]) - int(handle["t_offset"][()]) - 1
             local = np.append(np.arange(0, last_local, 10_000, dtype=np.int64), last_local)
             for key in ("t", "x", "y", "p"):
@@ -173,13 +165,11 @@ def test_coverage_uses_rgb_timestamp_or_explicit_exposure_endpoint(complete_dsec
             del handle["ms_to_idx"]
             handle["ms_to_idx"] = np.searchsorted(local, np.arange(last_local // 1000 + 2) * 1000)
     timestamp = check_dsec.check_dsec(root)
-    exposure = check_dsec.check_dsec(root, event_endpoint="exposure_end")
     if boundary == "first_start":
-        assert not timestamp["passed"] and exposure["passed"]
+        assert not timestamp["passed"]
         assert "event coverage insufficient" in errors_for(timestamp, "train")
     else:
-        assert timestamp["passed"] and not exposure["passed"]
-        assert "event coverage insufficient" in errors_for(exposure, "train")
+        assert timestamp["passed"]
 
 
 def test_deep_check_decodes_middle_image(complete_dsec):
