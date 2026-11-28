@@ -2,7 +2,7 @@
 
 用历史 RGB 与事件预测 DSEC 下一时刻的 DINOv2 特征，再用共享冻结检测头评测未来目标检测。默认间隔 50 ms，四帧历史；模型由冻结 DINOv2、RVT-S 和 8 层双路 Cross-Attention 预测器组成。B1/M1/M2 可以直接开始自监督训练，无需先训练或加载检测头。
 
-实现以项目 v3.1 设计为准。架构、监督、消融与验证记录见 [docs/v31.md](docs/v31.md)。2026-11-27 已在 Delta 完成无训练检查，包括真实 DSEC 的 batch 1/3 BF16 前向、反向与因果性验证；尚未启动训练或评测 AP。
+实现以项目 v3.1 设计为准。架构、监督、消融与验证记录见 [docs/v31.md](docs/v31.md)。2026-11-27 的实现已在 Delta 完成真实 DSEC 的 batch 1/3 BF16 前向、反向与因果性检查。2026-11-28 在 Delta 用合成特征对比完整 K/V＋mask 与可见 K/V 前缀，8 层 M2 predictor 的前向＋反向耗时下降约 58%–60%；不含 DINO、RVT 和数据读取。其他训练效率调整仅完成静态审查；未启动训练或评测 AP。
 
 ## 安装、权重与数据
 
@@ -44,7 +44,7 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
   --config configs/event_no_align.yaml
 ```
 
-三组相互独立，M2 不需要 B1 权重。配置分别保存到 `$Work/outputs/v31_b1`、`$Work/outputs/v31_m1`、`$Work/outputs/v31_m2`。默认每卡 batch 1、累积 8 步、40 epochs。当前继续使用原来目标帧有有效检测框的样本集合，数据加载仍需 `tracks.npy`；检测框用于筛选窗口和统计前景指标，不进入 predictor 的训练 loss。
+三组相互独立，M2 不需要 B1 权重。配置分别保存到 `$Work/outputs/v31_b1`、`$Work/outputs/v31_m1`、`$Work/outputs/v31_m2`。默认每卡 batch 1、40 epochs，`optimization.accumulation_steps: 1`，不开启梯度累积。只有显存无法容纳所需的每卡 batch 时，才降低每卡 batch 并手动开启累积。当前继续使用原来目标帧有有效检测框的样本集合，数据加载仍需 `tracks.npy`；检测框用于筛选窗口和统计前景指标，不进入 predictor 的训练 loss。
 
 共享检测头使用真实 RGB 的冻结 DINO 特征和检测标注独立训练：
 
@@ -53,11 +53,11 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
   --config configs/detector.yaml
 ```
 
-默认每卡 batch 4、累积 1 步、40 epochs，最佳权重保存为 `$Work/outputs/v31_detector/checkpoints/best.ckpt`。它与 predictor 训练相互独立，可分配不同 GPU 同时训练。上面的 `0` 为卡号示例，需替换为实际分配的 GPU。
+检测头任务只创建冻结 encoder 和 detector，只解码目标图像；样本集合与检测标注保持原样。默认每卡 batch 4、累积 1 步、40 epochs，最佳权重保存为 `$Work/outputs/v31_detector/checkpoints/best.ckpt`。它与 predictor 训练相互独立，可分配不同 GPU 同时训练。上面的 `0` 为卡号示例，需替换为实际分配的 GPU。
 
-实验设置写在 YAML 中：`data` 管理 batch 和 workers，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。训练命令只接受 `--config`、`--resume` 和可选的 `--output-dir`。恢复默认沿用 checkpoint 配方；字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
+实验设置写在 YAML 中：`data` 管理 batch 和 workers，`timing` 指定可选的自定义时间，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。默认时间由调用层一次性准备并显式传入模型，不额外检查时间值；自定义时间在模型外校验，见[时间边界](docs/v31.md#输入数据与时间边界)。训练命令只接受 `--config`、`--resume` 和可选的 `--output-dir`。恢复沿用 checkpoint 配方；当前只接受 `event-foresight-v31-training-v2`，旧训练 checkpoint 不再兼容。官方 DINOv2 预训练权重继续使用。字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
 
-观察训练时，在 TensorBoard 的 Scalars 中筛选 `^monitor/`，或打开 Custom Scalars 的 `Training overview`。其余指标归入 `details/`；完整 CSV 和逐轮验证报告继续保留。启动命令与指标含义见 [训练日志](docs/v31.md#训练日志)。
+观察训练时，在 TensorBoard 的 Scalars 中筛选 `^monitor/`，或打开 Custom Scalars 的 `Training overview`。step 曲线记录主 GPU 的本地 loss，epoch 曲线按样本数汇总所有 GPU；这些训练日志不参与优化或最佳权重选择。其余指标归入 `details/`；完整 CSV 和逐轮验证报告继续保留。启动命令与指标含义见 [训练日志](docs/v31.md#训练日志)。
 
 predictor 与检测头都完成后，用同一个冻结头评测：
 
