@@ -5,30 +5,25 @@ from pathlib import Path
 
 import torch
 
-TRAINING_FORMAT = "event-foresight-v31-training-v1"
+TRAINING_FORMAT = "event-foresight-v31-training-v2"
 
 
 def read_checkpoint(filename):
     path = Path(filename).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    try:
-        saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-    except RuntimeError as error:
-        if "mmap" not in str(error):
-            raise
-        saved = torch.load(path, map_location="cpu", weights_only=False)
+    saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if not isinstance(saved, Mapping) or not isinstance(saved.get("state_dict"), Mapping):
         raise ValueError("Checkpoint must contain a state_dict mapping")
     return saved
 
 
-def input_spec(config, forecaster):
+def input_spec(config, model):
     """Keep the DSEC inventory protocol separate from model architecture."""
     data = config["data"]
-    if tuple(data["image_size"]) != tuple(forecaster.image_size):
+    if tuple(data["image_size"]) != tuple(model.image_size):
         raise ValueError("Dataset image_size differs from the loaded DINO World model")
-    if data.get("context_frames", 4) != forecaster.history_length:
+    if hasattr(model, "history_length") and data.get("context_frames", 4) != model.history_length:
         raise ValueError("Dataset context_frames differs from the DINO World model")
     if data.get("frame_interval_s", 0.05) != 0.05:
         raise ValueError("DSEC uses a fixed 50 ms frame interval")
@@ -40,7 +35,7 @@ def input_spec(config, forecaster):
         "prediction_ms": 50,
         "frame_interval_s": data.get("frame_interval_s", 0.05),
         "preprocessing": "pil-bilinear-imagenet-mean-std",
-        "feature_space": forecaster.feature_space,
+        "feature_space": model.feature_space,
     }
 
     if config["model"].get("event", {}).get("enabled", False):
@@ -80,7 +75,9 @@ def load_predictor(predictor, filename, *, forecaster=None):
 
 def validate_encoder(saved, forecaster):
     expected = forecaster.encoder.state_dict()
-    actual = component_state(saved, "forecaster.encoder.")
+    # Both training stages save the same encoder component under their owner.
+    prefix = "encoder." if saved["stage"] == "detector" else "forecaster.encoder."
+    actual = component_state(saved, prefix)
     if expected.keys() != actual.keys() or any(
             not isinstance(actual[key], torch.Tensor) or expected[key].dtype != actual[key].dtype
             or not torch.equal(expected[key].detach().cpu(), actual[key]) for key in expected):

@@ -53,6 +53,23 @@ class TinyForecaster(nn.Module):
         return self.predictor(encoded)
 
 
+class TinyEncoder(nn.Module):
+    image_size = (2, 2)
+    feature_dim = 2
+    grid_size = (1, 1)
+    feature_space = "tiny-last-layer"
+    architecture = {"name": "tiny-encoder", "image_size": [2, 2], "feature_dim": 2}
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(nn.Linear(3, 2), nn.Dropout(0.5))
+        self.seen = []
+
+    def forward(self, rgb):
+        self.seen.append(rgb.detach().clone())
+        return self.backbone(rgb.mean((-1, -2)))[:, None]
+
+
 class TinyCriterion(nn.Module):
     def forward(self, outputs, targets, sync_num_boxes=False):
         assert sync_num_boxes
@@ -123,20 +140,18 @@ def test_predictor_uses_history_only_and_freezes_teacher(tmp_path, monkeypatch):
 
 
 def test_detector_updates_only_head(tmp_path):
-    task = DetectorTask(config(tmp_path), forecaster=TinyForecaster(),
+    task = DetectorTask(config(tmp_path), encoder=TinyEncoder(),
                         detector=nn.Linear(2, 1), criterion=TinyCriterion())
     task.train()
     batch = next(iter(DataLoader([sample(1), sample(2)], batch_size=2)))
     outputs = task(batch["future_rgb_target"])
     outputs.square().mean().backward()
-    assert all(not p.requires_grad and p.grad is None for p in task.forecaster.parameters())
+    assert all(not p.requires_grad and p.grad is None for p in task.encoder.parameters())
     assert all(p.requires_grad and p.grad is not None for p in task.detector.parameters())
-    assert not task.forecaster.training and task.detector.training
-    assert all(key.startswith(("forecaster.", "detector.")) for key in task.state_dict())
-    assert torch.equal(task.forecaster.seen[-1], batch["future_rgb_target"])
-    with pytest.raises(ValueError, match="real target RGB"):
-        task(batch["history_rgb"])
-
+    assert not task.encoder.training and task.detector.training
+    assert not hasattr(task, "forecaster")
+    assert all(key.startswith(("encoder.", "detector.")) for key in task.state_dict())
+    assert torch.equal(task.encoder.seen[-1], batch["future_rgb_target"])
 
 def test_full_lightning_checkpoint_resumes_optimizer_and_all_weights(tmp_path):
     torch.manual_seed(2)
@@ -254,16 +269,19 @@ def test_scratch_detector_architecture_is_saved_and_restored(tmp_path, monkeypat
     cfg["detector"] = {"hidden_dim": 8, "num_classes": 8, "num_queries": 2,
                        "num_levels": 1, "encoder_layers": 1, "decoder_layers": 1,
                        "heads": 2, "points": 1, "mlp_dim": 16, "dropout": 0.1}
-    task = DetectorTask(cfg, forecaster=TinyForecaster(), criterion=TinyCriterion())
+    task = DetectorTask(cfg, encoder=TinyEncoder(), criterion=TinyCriterion())
     payload = {"state_dict": task.state_dict()}
     task.on_save_checkpoint(payload)
+    assert payload["encoder_architecture"] == task.encoder.architecture
+    assert "forecaster_architecture" not in payload
+    assert not any("predictor" in key for key in payload["state_dict"])
     architecture = payload["detector_architecture"]
     assert architecture["feature_dim"] == 2 and architecture["grid_size"] == [1, 1]
     assert architecture["hidden_dim"] == 8
     monkeypatch.setattr("foresight.models.checkpoints.read_checkpoint", lambda path: payload)
     restored_config = resume_config(config(tmp_path), "unused.ckpt", "detector")
     assert restored_config["detector"]["hidden_dim"] == 8
-    restored = DetectorTask(restored_config, forecaster=TinyForecaster(), criterion=TinyCriterion())
+    restored = DetectorTask(restored_config, encoder=TinyEncoder(), criterion=TinyCriterion())
     restored.on_load_checkpoint(payload)
     restored.load_state_dict(payload["state_dict"], strict=True)
     assert all(torch.equal(task.state_dict()[key], value) for key, value in restored.state_dict().items())
@@ -283,13 +301,13 @@ def test_teacher_forcing_supervises_every_shifted_frame(tmp_path):
     assert task(batch["history_rgb"]).shape == (2, 4, 1, 2)
 
 
-def test_shared_detector_never_calls_the_untrained_predictor(tmp_path, monkeypatch):
+def test_shared_detector_never_constructs_a_forecaster(tmp_path, monkeypatch):
     cfg = config(tmp_path)
-    forecaster = TinyForecaster()
-    def forbidden_prediction(*args, **kwargs):
-        raise AssertionError("Shared detector training must use real features")
-    monkeypatch.setattr(forecaster.predictor, "forward", forbidden_prediction)
-    task = DetectorTask(cfg, forecaster=forecaster, detector=nn.Linear(2, 1), criterion=TinyCriterion())
+    def forbidden_forecaster(*args, **kwargs):
+        raise AssertionError("Shared detector training must not construct a forecaster")
+    monkeypatch.setattr("foresight.models.forecaster.DINOWorldForecaster", forbidden_forecaster)
+    monkeypatch.setattr("foresight.models.encoder.DINOFeatureEncoder", lambda *args, **kwargs: TinyEncoder())
+    task = DetectorTask(cfg, detector=nn.Linear(2, 1), criterion=TinyCriterion())
     result = task(torch.randn(2, 3, 2, 2))
     assert result.shape == (2, 1, 1)
 
@@ -330,7 +348,7 @@ def test_predictor_initializer_is_only_used_by_predictor_stage(tmp_path):
     for name, value in predictor_task.forecaster.state_dict().items():
         assert torch.equal(restored.forecaster.state_dict()[name], value)
     with pytest.raises(ValueError, match="without a predictor initializer"):
-        DetectorTask(cfg, forecaster=fresh, detector=nn.Linear(2, 1), criterion=TinyCriterion())
+        DetectorTask(cfg, encoder=TinyEncoder(), detector=nn.Linear(2, 1), criterion=TinyCriterion())
 
 
 @pytest.mark.parametrize("max_steps,max_epochs,accumulation", [(1, 3, 1), (1, 3, 2), (1, 1, 2), (-1, 1, 2)])
@@ -435,7 +453,7 @@ def test_training_loaders_always_use_one_step_targets(tmp_path, monkeypatch, sta
     if stage == 'predictor':
         task = PredictorTask(cfg, forecaster=TinyForecaster())
     else:
-        task = DetectorTask(cfg, forecaster=TinyForecaster(), detector=nn.Linear(2, 1),
+        task = DetectorTask(cfg, encoder=TinyEncoder(), detector=nn.Linear(2, 1),
                             criterion=TinyCriterion())
     task._trainer = SimpleNamespace(world_size=1, global_rank=0)
     observed = []
@@ -448,5 +466,6 @@ def test_training_loaders_always_use_one_step_targets(tmp_path, monkeypatch, sta
     monkeypatch.setattr('foresight.data.dataset_from_config', dataset_factory)
     loader = task._loader(split)
     assert loader.dataset is examples
-    assert observed == [(split, {'future_rgb': True, 'prediction_frames': 1})]
+    assert observed == [(split, {'future_rgb': True, 'prediction_frames': 1,
+                                 'target_only': stage == 'detector'})]
     assert task.config['data']['prediction_frames'] == 4

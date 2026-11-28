@@ -68,6 +68,7 @@ class FutureDetector(nn.Module):
                  heads=8, points=4, mlp_dim=1024, dropout=0.1):
         super().__init__()
         self.grid_size, self.num_levels = grid_size, num_levels
+        self.feature_dim = feature_dim
         self.grid_hw = normalize_hw(grid_size, "grid_size")
         self.architecture = dict(feature_dim=feature_dim, grid_size=list(self.grid_hw),
                                  hidden_dim=hidden_dim, num_classes=num_classes,
@@ -102,11 +103,8 @@ class FutureDetector(nn.Module):
 
     def forward(self, features):
         """[B,N,D] future features -> logits, normalized cxcywh boxes, auxiliary outputs."""
-        if features.ndim != 3 or features.shape[1] != self.grid_hw[0] * self.grid_hw[1]:
-            raise ValueError(f"features must have shape [B,{self.grid_hw[0] * self.grid_hw[1]},D] "
-                             f"for grid_size {self.grid_hw}, got {tuple(features.shape)}")
         batch = features.shape[0]
-        feature = self.input_proj(features.transpose(1, 2).reshape(batch, -1, *self.grid_hw))
+        feature = self.input_proj(features.transpose(1, 2).reshape(batch, self.feature_dim, *self.grid_hw))
         levels = [feature]
         for downsample in self.downsample:
             levels.append(downsample(levels[-1]))

@@ -14,13 +14,13 @@ class DetectorTask(_ForecastTask):
 
     stage = "detector"
 
-    def __init__(self, config, *, forecaster=None, detector=None, criterion=None):
+    def __init__(self, config, *, encoder=None, detector=None, criterion=None):
         if config["model"].get("event", {}).get("enabled", False):
             raise ValueError("Train the shared head with the RGB detector configuration")
         if config["model"].get("predictor_checkpoint") or config["model"].get("rgb_checkpoint"):
             raise ValueError("The shared head trains on real DINO features without a predictor initializer")
-        super().__init__(config, forecaster=forecaster)
-        self.forecaster.requires_grad_(False).eval()
+        super().__init__(config, encoder=encoder)
+        self.encoder.requires_grad_(False).eval()
         architecture = deepcopy(getattr(detector, "architecture", None))
         if detector is None:
             from ..models.detection.detector import FutureDetector
@@ -28,8 +28,8 @@ class DetectorTask(_ForecastTask):
                             inspect.signature(FutureDetector.__init__).parameters.items()
                             if name != "self" and parameter.default is not inspect.Parameter.empty}
             architecture.update(config.get("detector", {}))
-            architecture.update(feature_dim=self.forecaster.feature_dim,
-                                grid_size=list(self.forecaster.grid_size))
+            architecture.update(feature_dim=self.encoder.feature_dim,
+                                grid_size=list(self.encoder.grid_size))
             detector = FutureDetector(**architecture)
         self.detector_architecture = architecture
         self.detector = detector.requires_grad_(True)
@@ -51,14 +51,12 @@ class DetectorTask(_ForecastTask):
 
     def train(self, mode=True):
         super().train(mode)
-        self.forecaster.eval()
+        self.encoder.eval()
         return self
 
     def forward(self, rgb):
-        if rgb.ndim != 4:
-            raise ValueError("Shared detector training requires a real target RGB frame [B,3,H,W]")
         with torch.no_grad():
-            features = self.forecaster.encode_latents(rgb)
+            features = self.encoder(rgb)
         return self.detector(features)
 
     @torch.no_grad()
@@ -68,7 +66,7 @@ class DetectorTask(_ForecastTask):
 
     def training_step(self, batch, batch_idx):
         losses = self.criterion(self(batch["future_rgb_target"]), batch["targets"], sync_num_boxes=True)
-        batch_size = len(batch["history_rgb"])
+        batch_size = len(batch["future_rgb_target"])
         log_training_losses(self, {f"train_{key}": value for key, value in losses.items()},
                             batch_size=batch_size)
         return self._training_loss(losses["loss"], batch_size)

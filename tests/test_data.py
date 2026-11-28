@@ -117,6 +117,36 @@ def test_rgb_preprocessing_matches_pil_reference_exactly():
     torch.testing.assert_close(preprocess_rgb(pixels, (28, 42)), expected, rtol=0, atol=0)
 
 
+def test_target_only_preserves_inventory_labels_and_augmentation_without_history_reads(rgb_fixture, monkeypatch):
+    root = rgb_fixture[0]
+    options = dict(image_size=(28, 42), future_rgb=True,
+                   sample_ids=["seq:43", "seq:39"], horizontal_flip_prob=1.0)
+    with RGBDataset(root, **options) as forecast:
+        expected = forecast[0]
+        windows = list(forecast.windows)
+    calls = []
+    original = RGBSequenceReader.read_image
+    def record(self, index):
+        calls.append(index)
+        return original(self, index)
+    monkeypatch.setattr(RGBSequenceReader, "read_image", record)
+    with RGBDataset(root, target_only=True, **options) as detector:
+        actual = detector[0]
+        assert detector.windows == windows
+        assert detector.sample_ids == options["sample_ids"]
+        assert detector.source_indices == [4, 0]
+        assert calls == [44]
+        assert "history_rgb" not in actual
+        assert actual["meta"] == expected["meta"]
+        torch.testing.assert_close(actual["future_rgb_target"], expected["future_rgb_target"], rtol=0, atol=0)
+        for key in ("boxes", "labels"):
+            torch.testing.assert_close(actual["target"][key], expected["target"][key], rtol=0, atol=0)
+        batch = collate_rgb([actual, actual])
+        assert "history_rgb" not in batch and batch["future_rgb_target"].shape == (2, 3, 28, 42)
+        with pytest.raises(ValueError, match="mix"):
+            collate_rgb([expected, actual])
+
+
 def test_reader_clips_original_coordinates_and_drops_zero_area(rgb_fixture):
     root, path, times, _ = rgb_fixture
     tracks = np.array([(times[40], -10, -20, 1000, 1000, 0, .7, 1),
@@ -131,7 +161,8 @@ def test_reader_clips_original_coordinates_and_drops_zero_area(rgb_fixture):
 
 @pytest.mark.parametrize("kwargs", [{"context_frames": 41}, {"stride": 0}, {"tolerance_us": -1},
                                     {"image_size": (29, 42)}, {"split": "unknown"},
-                                    {"sequences": ["outside"]}, {"future_rgb": 1}])
+                                    {"sequences": ["outside"]}, {"future_rgb": 1},
+                                    {"target_only": True}, {"target_only": 1}])
 def test_invalid_protocol_is_rejected_before_loading(rgb_fixture, kwargs):
     with pytest.raises(ValueError):
         RGBDataset(rgb_fixture[0], **kwargs)

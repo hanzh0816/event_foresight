@@ -48,24 +48,22 @@ def trained_detector(tmp_path, monkeypatch):
                         num_classes=8, num_queries=3, num_levels=1,
                         encoder_layers=1, decoder_layers=1, heads=2,
                         points=1, mlp_dim=16, dropout=0.0)
-    source = pipeline.ForecastDetector(TinyForecaster(), FutureDetector(**architecture))
-    with torch.no_grad():
-        # The head checkpoint contains an untrained predictor. Its distinct
-        # values must never replace the separately trained prediction weights.
-        source.forecaster.predictor.weight.fill_(1.25)
-        source.forecaster.predictor.bias.fill_(1.5)
     config = dict(model=dict(encoder_checkpoint=str(tmp_path / "unused_dinov2.pth"),
                              predictor_checkpoint=str(tmp_path / "predictor.ckpt")),
                   data=dict(image_size=[28, 42], context_frames=4),
                   runtime=dict(encoder_chunk_size=1))
+    source = pipeline.ForecastDetector(TinyForecaster(), FutureDetector(**architecture))
     payload = dict(foresight_format=TRAINING_FORMAT, stage="detector",
                    detector_architecture=architecture,
-                   forecaster_architecture=deepcopy(source.forecaster.architecture),
+                   encoder_architecture={"model": "tiny-encoder"},
                    input_spec=input_spec(config, source.forecaster),
-                   state_dict=deepcopy(source.state_dict()))
+                   state_dict={**{f"encoder.{name}": value.clone()
+                                   for name, value in source.forecaster.encoder.state_dict().items()},
+                               **{f"detector.{name}": value.clone()
+                                   for name, value in source.detector.state_dict().items()}})
     checkpoint = tmp_path / "detector.ckpt"
     torch.save(payload, checkpoint)
-    predictor = {name: value.clone() for name, value in payload["state_dict"].items()
+    predictor = {name: value.clone() for name, value in source.state_dict().items()
                  if name.startswith("forecaster.")}
     predictor["forecaster.predictor.weight"].fill_(7.0)
     predictor["forecaster.predictor.bias"].fill_(-3.0)
@@ -88,7 +86,8 @@ def trained_detector(tmp_path, monkeypatch):
 def test_pipeline_assembles_shared_head_and_separate_trained_predictor(trained_detector):
     case = trained_detector
     restored = pipeline.load_pipeline(case.config, case.checkpoint)
-    expected = deepcopy(case.payload["state_dict"])
+    expected = {name: value for name, value in case.payload["state_dict"].items()
+                if name.startswith("detector.")}
     expected.update(case.predictor_payload["state_dict"])
     assert_state_equal(restored.state_dict(), expected)
     assert restored.detector.grid_hw == (2, 3)
@@ -128,7 +127,8 @@ def test_shared_detector_requires_strict_head_weights(trained_detector, corrupti
 def test_shared_head_and_predictor_reject_changed_frozen_encoder(trained_detector, checkpoint_kind, key):
     case = trained_detector
     payload = case.payload if checkpoint_kind == "detector" else case.predictor_payload
-    payload["state_dict"][f"forecaster.encoder.{key}"].add_(1.0)
+    prefix = "encoder" if checkpoint_kind == "detector" else "forecaster.encoder"
+    payload["state_dict"][f"{prefix}.{key}"].add_(1.0)
     path = case.checkpoint if checkpoint_kind == "detector" else case.config["model"]["predictor_checkpoint"]
     torch.save(payload, path)
     with pytest.raises(ValueError, match="different frozen encoder"):
@@ -168,14 +168,10 @@ def test_predictor_rejects_semantic_or_encoder_dtype_mismatch(trained_detector, 
         pipeline.load_pipeline(case.config, case.checkpoint)
 
 
-def test_head_predictor_architecture_can_differ_from_forecast_model(trained_detector):
+def test_shared_head_checkpoint_contains_no_predictor_or_forecaster(trained_detector):
     case = trained_detector
-    case.payload["forecaster_architecture"]["predictor"] = {"depth": 8, "event_enabled": True}
-    # Detector training has no dependency on these untrained predictor tensors.
-    for name in list(case.payload["state_dict"]):
-        if name.startswith("forecaster.predictor."):
-            del case.payload["state_dict"][name]
-    torch.save(case.payload, case.checkpoint)
+    assert "forecaster_architecture" not in case.payload
+    assert all(name.startswith(("encoder.", "detector.")) for name in case.payload["state_dict"])
     restored = pipeline.load_pipeline(case.config, case.checkpoint)
     assert torch.equal(restored.forecaster.predictor.weight,
                        case.predictor_payload["state_dict"]["forecaster.predictor.weight"])

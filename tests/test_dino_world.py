@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from foresight.models import forecaster
+from foresight.models import encoder, forecaster
 from foresight.models.forecaster import DINOWorldForecaster
 from foresight.models.predictor import DINOWorldPredictor, PREDICTOR_DEFAULTS
 from foresight.models.attention import apply_rope_3d
@@ -209,7 +209,7 @@ def test_invalid_or_causally_empty_timestamps_are_rejected(context_times, query_
 
 
 def test_model_source_does_not_download_weights_or_use_hub():
-    source = Path(forecaster.__file__).read_text()
+    source = Path(forecaster.__file__).read_text() + Path(encoder.__file__).read_text()
     assert 'torch.hub.' not in source
     assert 'load_state_dict_from_url' not in source
 
@@ -238,7 +238,7 @@ def tiny_forecaster(checkpoint):
 
 
 def test_forecaster_strictly_loads_frozen_last_layer_tokens_without_pca(tmp_path, monkeypatch):
-    monkeypatch.setattr(forecaster, 'vit_base', TinyBackbone)
+    monkeypatch.setattr(encoder, 'vit_base', TinyBackbone)
     path = tmp_path / 'encoder.pth'
     state = TinyBackbone().state_dict()
     state['scale'].add_(.125)
@@ -254,7 +254,7 @@ def test_forecaster_strictly_loads_frozen_last_layer_tokens_without_pca(tmp_path
                 + state['scale'][None, None, :])
     torch.testing.assert_close(tokens, expected)
     assert not tokens.requires_grad
-    assert model.encoder.seen == [dict(batch=1, layers=[11], reshape=False,
+    assert model.encoder.backbone.seen == [dict(batch=1, layers=[11], reshape=False,
                                       training=False, grad_enabled=False)] * 3
     history = torch.randn(2, 4, 3, 28, 42, requires_grad=True)
     predictions = model(history)
@@ -270,7 +270,7 @@ def test_forecaster_strictly_loads_frozen_last_layer_tokens_without_pca(tmp_path
 
 @pytest.mark.parametrize('corruption', ['missing', 'unexpected', 'wrong_shape', 'nonfinite', 'wrapped'])
 def test_encoder_checkpoint_rejects_incompatible_or_corrupt_weights(tmp_path, monkeypatch, corruption):
-    monkeypatch.setattr(forecaster, 'vit_base', TinyBackbone)
+    monkeypatch.setattr(encoder, 'vit_base', TinyBackbone)
     state = TinyBackbone().state_dict()
     if corruption == 'missing':
         del state['scale']
@@ -499,7 +499,7 @@ class TinyGridBackbone(TinyBackbone):
 
 
 def test_forecaster_integrates_rvt_and_only_freezes_rgb_encoder(tmp_path, monkeypatch):
-    monkeypatch.setattr(forecaster, 'vit_base', TinyGridBackbone)
+    monkeypatch.setattr(encoder, 'vit_base', TinyGridBackbone)
     path = tmp_path / 'encoder.pth'
     torch.save(TinyGridBackbone().state_dict(), path)
     model = DINOWorldForecaster(

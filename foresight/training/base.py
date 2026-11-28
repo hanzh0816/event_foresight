@@ -24,41 +24,57 @@ class _ForecastTask(LightningModule):
 
     stage = None
 
-    def __init__(self, config, *, forecaster=None):
+    def __init__(self, config, *, forecaster=None, encoder=None):
         super().__init__()
         self.config = deepcopy(config)
         if self.config["model"].get("rgb_checkpoint"):
             self.config["optimization"]["rgb_finetune"] = True
         self.save_hyperparameters({"config": self.config})
-        if forecaster is None:
-            from ..models.forecaster import DINOWorldForecaster
-            data = config["data"]
-            forecaster = DINOWorldForecaster(
-                config["model"]["encoder_checkpoint"], image_size=data["image_size"],
-                history_length=data.get("context_frames", 4),
-                frame_interval_s=data.get("frame_interval_s", 0.05),
-                encoder_chunk_size=config.get("runtime", {}).get("encoder_chunk_size", 1),
-                predictor_options=config["model"].get("predictor", {}),
-                event_options=config["model"].get("event", {}))
-        self.forecaster = forecaster
-        predictor_checkpoint = config["model"].get("predictor_checkpoint")
-        if predictor_checkpoint:
-            from ..models.checkpoints import load_predictor
-            load_predictor(self.forecaster.predictor, predictor_checkpoint, forecaster=self.forecaster)
-        if config["model"].get("rgb_checkpoint"):
-            from ..models.checkpoints import load_rgb_initializer
-            load_rgb_initializer(self.forecaster, config["model"]["rgb_checkpoint"])
+        data = config["data"]
+        if self.stage == "detector":
+            if forecaster is not None:
+                raise ValueError("Detector training accepts an encoder, not a forecaster")
+            if encoder is None:
+                from ..models.encoder import DINOFeatureEncoder
+                encoder = DINOFeatureEncoder(
+                    config["model"]["encoder_checkpoint"], image_size=data["image_size"],
+                    chunk_size=config.get("runtime", {}).get("encoder_chunk_size", 1))
+            self.encoder = encoder
+            model = self.encoder
+        else:
+            if encoder is not None:
+                raise ValueError("Predictor training owns its encoder through the forecaster")
+            if forecaster is None:
+                from ..models.forecaster import DINOWorldForecaster
+                forecaster = DINOWorldForecaster(
+                    config["model"]["encoder_checkpoint"], image_size=data["image_size"],
+                    history_length=data.get("context_frames", 4),
+                    frame_interval_s=data.get("frame_interval_s", 0.05),
+                    encoder_chunk_size=config.get("runtime", {}).get("encoder_chunk_size", 1),
+                    predictor_options=config["model"].get("predictor", {}),
+                    event_options=config["model"].get("event", {}))
+            self.forecaster = forecaster
+            predictor_checkpoint = config["model"].get("predictor_checkpoint")
+            if predictor_checkpoint:
+                from ..models.checkpoints import load_predictor
+                load_predictor(self.forecaster.predictor, predictor_checkpoint, forecaster=self.forecaster)
+            if config["model"].get("rgb_checkpoint"):
+                from ..models.checkpoints import load_rgb_initializer
+                load_rgb_initializer(self.forecaster, config["model"]["rgb_checkpoint"])
+            model = self.forecaster
         self.datasets = {}
         self.accumulated_examples = 0
         self.last_report = None
         self.last_validation_step = None
-        self.input_spec = input_spec(config, forecaster)
+        self.input_spec = input_spec(config, model)
 
     def _loader(self, split):
         from ..data import dataset_from_config, collate_rgb
         data = self.config["data"]
         if split not in self.datasets:
-            self.datasets[split] = dataset_from_config(self.config, split, future_rgb=True, prediction_frames=1)
+            self.datasets[split] = dataset_from_config(
+                self.config, split, future_rgb=True, prediction_frames=1,
+                target_only=self.stage == "detector")
         dataset = self.datasets[split]
         if not len(dataset):
             raise ValueError(f"No valid DSEC {split} windows")
@@ -136,7 +152,8 @@ class _ForecastTask(LightningModule):
     def configure_optimizers(self):
         options = self.config["optimization"]
         betas = tuple(options.get("betas", (0.9, 0.95)))
-        event_encoder = getattr(self.forecaster, "event_encoder", None)
+        event_encoder = (getattr(self.forecaster, "event_encoder", None)
+                         if self.stage == "predictor" else None)
         if self.stage == "predictor" and event_encoder is not None:
             event_params = list(event_encoder.parameters())
             event_ids = {id(p) for p in event_params}
@@ -192,21 +209,26 @@ class _ForecastTask(LightningModule):
         }
 
     def on_save_checkpoint(self, checkpoint):
-        # The complete model state is intentional: resume never silently
-        # substitutes a different frozen encoder or predictor.
+        # Keep the complete stage model, including its frozen feature encoder.
         checkpoint["foresight_format"] = CHECKPOINT_FORMAT
         checkpoint["stage"] = self.stage
         checkpoint["config"] = deepcopy(self.config)
         checkpoint["input_spec"] = deepcopy(self.input_spec)
         checkpoint["training_spec"] = self._training_spec()
-        checkpoint["forecaster_architecture"] = deepcopy(self.forecaster.architecture)
+        if self.stage == "predictor":
+            checkpoint["forecaster_architecture"] = deepcopy(self.forecaster.architecture)
+        else:
+            checkpoint["encoder_architecture"] = deepcopy(self.encoder.architecture)
 
     def on_load_checkpoint(self, checkpoint):
         if checkpoint.get("foresight_format") != CHECKPOINT_FORMAT:
             raise ValueError("--resume requires a full event-foresight training checkpoint")
         if checkpoint.get("stage") != self.stage:
             raise ValueError("Cannot resume a checkpoint from a different training stage")
-        validate_forecaster(checkpoint, self.forecaster)
+        if self.stage == "predictor":
+            validate_forecaster(checkpoint, self.forecaster)
+        elif checkpoint.get("encoder_architecture") != self.encoder.architecture:
+            raise ValueError("Checkpoint DINO encoder architecture differs")
         if checkpoint.get("input_spec") != self.input_spec:
             raise ValueError("Training checkpoint and configured RGB data/feature protocol differ")
         if checkpoint.get("training_spec") != self._training_spec():

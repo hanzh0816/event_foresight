@@ -36,13 +36,15 @@ class RGBDataset:
     """Inventory uses 40 frames; the model receives the final four by default.
 
     Future RGB is an explicit training target opt-in. It is never concatenated
-    into history_rgb. The default detector/evaluation path does not decode it.
+    into history_rgb. Forecast evaluation does not decode it by default.
+    Detector training uses target_only to skip history image decoding while
+    preserving the same windows, target labels and metadata.
     Sample selection preserves the supplied ID order and original inventory.
     """
     def __init__(self, root, split="train", image_size=(448, 896), sample_history_frames=40,
                  context_frames=4, stride=1, tolerance_us=1000, sequences=None,
                  future_rgb=False, sample_ids=None, prediction_frames=1,
-                 horizontal_flip_prob=0.0):
+                 horizontal_flip_prob=0.0, target_only=False):
         require_int(sample_history_frames, "sample_history_frames", 1)
         require_int(context_frames, "context_frames", 1)
         require_int(prediction_frames, "prediction_frames", 1)
@@ -60,6 +62,8 @@ class RGBDataset:
             raise ValueError(f"Unknown DSEC split: {split!r}")
         if type(future_rgb) is not bool:
             raise ValueError("future_rgb must be a boolean")
+        if type(target_only) is not bool or (target_only and not future_rgb):
+            raise ValueError("target_only requires future_rgb=True and must be a boolean")
         self.root = Path(root).expanduser().resolve()
         self.split = split
         self.image_size = _size(image_size)
@@ -74,6 +78,7 @@ class RGBDataset:
         self.horizontal_flip_prob = float(horizontal_flip_prob)
         self.stride, self.tolerance_us = int(stride), int(tolerance_us)
         self.future_rgb = future_rgb
+        self.target_only = target_only
         self.selected_sequences = None if sequences is None else tuple(sequences)
         self.sequences = DEFAULT_SPLITS[split] if sequences is None else self.selected_sequences
         if len(set(self.sequences)) != len(self.sequences):
@@ -142,7 +147,6 @@ class RGBDataset:
         x0, y0, x1, y1 = xyxy.unbind(-1)
         boxes = torch.stack(((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0), dim=-1)
         sample = {
-            "history_rgb": torch.stack([self._image(reader, i) for i in range(start, end + 1)]),
             "target": {"boxes": boxes, "labels": torch.from_numpy(target.class_ids.copy())},
             "meta": {"sample_id": f"{name}:{end}", "target_id": target.target_id,
                      "target_timestamp_us": target.timestamp_us,
@@ -150,12 +154,15 @@ class RGBDataset:
                      "input_cutoff_us": int(reader.timestamps[end]),
                      "prediction_frames": self.prediction_frames},
         }
+        if not self.target_only:
+            sample["history_rgb"] = torch.stack([self._image(reader, i) for i in range(start, end + 1)])
         if self.future_rgb:
             sample["future_rgb_target"] = self._image(reader, target_index)
         flipped = self.horizontal_flip_prob > 0 and torch.rand(()).item() < self.horizontal_flip_prob
         sample["meta"]["horizontal_flipped"] = bool(flipped)
         if flipped:
-            sample["history_rgb"] = sample["history_rgb"].flip(-1)
+            if "history_rgb" in sample:
+                sample["history_rgb"] = sample["history_rgb"].flip(-1)
             sample["target"]["boxes"][:, 0] = 1 - sample["target"]["boxes"][:, 0]
             if self.future_rgb:
                 sample["future_rgb_target"] = sample["future_rgb_target"].flip(-1)
@@ -179,15 +186,9 @@ class RGBDataset:
 
 
 def collate_rgb(samples):
-    batch = {"history_rgb": torch.stack([sample["history_rgb"] for sample in samples]),
-             "targets": [sample["target"] for sample in samples],
+    batch = {"targets": [sample["target"] for sample in samples],
              "meta": [sample["meta"] for sample in samples]}
-    present = ["future_rgb_target" in sample for sample in samples]
-    if any(present) and not all(present):
-        raise ValueError("Cannot mix forecast and future-target samples in one batch")
-    if all(present):
-        batch["future_rgb_target"] = torch.stack([sample["future_rgb_target"] for sample in samples])
-    for key in ("history_events", "event_activity"):
+    for key in ("history_rgb", "future_rgb_target", "history_events", "event_activity"):
         present = [key in sample for sample in samples]
         if any(present) and not all(present):
             raise ValueError(f"Cannot mix samples with and without {key}")
