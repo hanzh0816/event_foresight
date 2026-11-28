@@ -55,7 +55,9 @@ CUDA_VISIBLE_DEVICES=0 python -m foresight.train \
 
 检测头任务只创建冻结 encoder 和 detector，只解码目标图像；样本集合与检测标注保持原样。默认每卡 batch 4、累积 1 步、40 epochs，最佳权重保存为 `$Work/outputs/v31_detector/checkpoints/best.ckpt`。它与 predictor 训练相互独立，可分配不同 GPU 同时训练。上面的 `0` 为卡号示例，需替换为实际分配的 GPU。
 
-实验设置写在 YAML 中：`data` 管理 batch 和 workers，`timing` 指定可选的自定义时间，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。默认时间由调用层一次性准备并显式传入模型，不额外检查时间值；自定义时间在模型外校验，见[时间边界](docs/v31.md#输入数据与时间边界)。训练命令只接受 `--config`、`--resume` 和可选的 `--output-dir`。恢复沿用 checkpoint 配方；当前只接受 `event-foresight-v31-training-v2`，旧训练 checkpoint 不再兼容。官方 DINOv2 预训练权重继续使用。字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
+实验设置写在 YAML 中：`data` 管理默认 batch 和 workers，`timing` 指定可选的自定义时间，`optimization` 管理学习率、累积和训练预算，`model` 管理结构及权重路径。新训练可以用 `--batch-size 4` 覆盖每卡 batch，实际值写入训练目录的 `config_train.yaml` 中的 `data.batch_size`。不传则使用 YAML 默认值；`--resume` 沿用 checkpoint 中的 batch，不能同时传 `--batch-size`，恢复后的配置保存为 `config_resume.yaml`。
+
+默认时间由调用层一次性准备并显式传入模型，不额外检查时间值；自定义时间在模型外校验，见[时间边界](docs/v31.md#输入数据与时间边界)。训练命令接受 `--config`、`--batch-size`、`--resume` 和 `--output-dir`。恢复沿用 checkpoint 配方；当前只接受 `event-foresight-v31-training-v2`，旧训练 checkpoint 不再兼容。官方 DINOv2 预训练权重继续使用。字段说明与恢复方式见 [配置与训练预算](docs/v31.md#配置与训练预算)。
 
 观察训练时，在 TensorBoard 的 Scalars 中筛选 `^monitor/`，或打开 Custom Scalars 的 `Training overview`。step 曲线记录主 GPU 的本地 loss，epoch 曲线按样本数汇总所有 GPU；这些训练日志不参与优化或最佳权重选择。其余指标归入 `details/`；完整 CSV 和逐轮验证报告继续保留。启动命令与指标含义见 [训练日志](docs/v31.md#训练日志)。
 
