@@ -24,8 +24,6 @@ def partition_tokens(x: Tensor, size: tuple[int, int], grid: bool) -> Tensor:
     """Group NHWC features into contiguous blocks or dilated global grids."""
     batch, height, width, channels = x.shape
     ph, pw = size
-    if height % ph or width % pw:
-        raise ValueError(f"Feature grid {(height, width)} is not divisible by {size}")
     if grid:
         grouped = x.reshape(batch, ph, height // ph, pw, width // pw, channels)
         grouped = grouped.permute(0, 2, 4, 1, 3, 5)
@@ -114,13 +112,7 @@ class PixelLSTM(nn.Module):
             hidden = torch.zeros_like(x)
             cell = torch.zeros_like(x, dtype=torch.float32)
         else:
-            if not isinstance(state, (tuple, list)) or len(state) != 2:
-                raise ValueError("Each RVT stage state must be a (hidden, cell) pair")
             hidden, cell = state
-            if hidden.shape != x.shape or cell.shape != x.shape:
-                raise ValueError("RVT state shape must match this clip's batch and stage grid")
-            if hidden.device != x.device or cell.device != x.device:
-                raise ValueError("RVT state and input must be on the same device")
             hidden = hidden.to(x.dtype)
         forget, write, read, candidate = self.gates(torch.cat((x, hidden), dim=1)).float().chunk(4, dim=1)
         # Keep the additive memory in FP32 under bf16 autocast.
@@ -252,23 +244,19 @@ class RVTEventEncoder(nn.Module):
     def forward(
         self, events: Tensor, state: RVTState | None = None, *, return_state: bool = False,
     ) -> Tensor | tuple[Tensor, RVTState]:
-        if events.ndim != 5:
-            raise ValueError("RVT events must have shape [B,T,C,H,W]")
-        batch, steps, channels, height, width = events.shape
-        if not batch or not steps:
-            raise ValueError("RVT needs nonempty batches and event histories")
-        if channels != self.in_channels or (height, width) != self.input_size:
-            raise ValueError(f"Expected [B,T,{self.in_channels},{self.input_size[0]},{self.input_size[1]}]")
-        if not events.is_floating_point():
-            raise ValueError("RVT expects floating point log-count event voxels")
-        if state is not None and len(state) != len(self.stages):
-            raise ValueError("RVT state must contain exactly four stage states")
+        batch, steps, _, height, width = events.shape
+        if state is not None:
+            for index, (channels, (hidden, cell)) in enumerate(zip(self.channels, state, strict=True)):
+                stride = 4 * 2 ** index
+                expected = (batch, channels, height // stride, width // stride)
+                if hidden.shape != expected or cell.shape != expected:
+                    raise ValueError("RVT state shape must match this clip's batch and stage grid")
         previous = state if state is not None else (None,) * len(self.stages)
         outputs = []
         for step in range(steps):
             x = events[:, step]
             stage_features, next_states = [], []
-            for stage, old_state in zip(self.stages, previous):
+            for stage, old_state in zip(self.stages, previous, strict=True):
                 x, new_state = stage(x, old_state)
                 stage_features.append(x)
                 next_states.append(new_state)

@@ -1,9 +1,11 @@
 """Construct RGB and Event-RGB datasets with the same sample and label rules."""
 
 from .rgb import RGBDataset
+from ..timing import validate_dsec_timing
 
 
 def dataset_from_config(config, split, future_rgb=False, *, target_only=False, **overrides):
+    validate_dsec_timing(config)
     data = config["data"]
     event = config.get("model", {}).get("event", {})
     kwargs = dict(

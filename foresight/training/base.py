@@ -49,7 +49,6 @@ class _ForecastTask(LightningModule):
                 forecaster = DINOWorldForecaster(
                     config["model"]["encoder_checkpoint"], image_size=data["image_size"],
                     history_length=data.get("context_frames", 4),
-                    frame_interval_s=data.get("frame_interval_s", 0.05),
                     encoder_chunk_size=config.get("runtime", {}).get("encoder_chunk_size", 1),
                     predictor_options=config["model"].get("predictor", {}),
                     event_options=config["model"].get("event", {}))

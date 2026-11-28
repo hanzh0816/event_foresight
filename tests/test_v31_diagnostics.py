@@ -9,6 +9,7 @@ from torch import nn
 
 from foresight.evaluation.diagnostics import mismatched_donors, motion_subset
 from foresight.inference.pipeline import ForecastDetector
+from foresight.timing import ForecastTiming
 
 
 class DonorInventory:
@@ -96,16 +97,16 @@ class RecordingPredictor(nn.Module):
         super().__init__()
         self.calls = []
 
-    def forward(self, history, **kwargs):
-        self.calls.append(kwargs)
+    def forward(self, history, context_times, query_times, **kwargs):
+        self.calls.append(dict(kwargs, context_times=context_times, query_times=query_times))
         if kwargs.get("event_off"):
             return history[:, -1]
         return history[:, -1] + kwargs["event_context"][:, -1]
 
-    def rollout(self, history, steps, **kwargs):
-        self.calls.append(dict(kwargs, steps=steps))
+    def rollout(self, history, context_times, query_times, **kwargs):
+        self.calls.append(dict(kwargs, context_times=context_times, query_times=query_times))
         value = history[:, -1] + kwargs["event_context"][:, -1]
-        return value[:, None].expand(-1, steps, -1, -1)
+        return value[:, None].expand(-1, len(query_times), -1, -1)
 
 
 class RecordingForecaster(nn.Module):
@@ -129,7 +130,7 @@ class RecordingForecaster(nn.Module):
 
 def test_zero_intervention_runs_encoder_and_off_skips_entire_event_path():
     forecaster = RecordingForecaster()
-    model = ForecastDetector(forecaster, nn.Identity())
+    model = ForecastDetector(forecaster, nn.Identity(), timing=ForecastTiming.from_config({'data': {}}))
     history = torch.arange(4 * 3 * 2 * 2, dtype=torch.float32).reshape(1, 4, 3, 2, 2)
     events = torch.zeros(1, 4, 20, 2, 2)
     zero = model.features(history, events)
@@ -143,20 +144,23 @@ def test_zero_intervention_runs_encoder_and_off_skips_entire_event_path():
 
 def test_rollout_pipeline_encodes_only_supplied_observed_events_once():
     forecaster = RecordingForecaster()
-    model = ForecastDetector(forecaster, nn.Identity())
+    model = ForecastDetector(forecaster, nn.Identity(), timing=ForecastTiming.from_config({'data': {}}))
     history = torch.zeros(4, 4, 3, 2, 2)
     events = torch.randn(4, 4, 20, 2, 2)
     prediction = model.features(history, events, horizon_steps=4)
     assert prediction.shape == (4, 1, 2)
     assert len(forecaster.event_calls) == 1
     torch.testing.assert_close(forecaster.event_calls[0], events)
-    assert forecaster.predictor.calls[-1]["steps"] == 4
-    assert forecaster.predictor.calls[-1]["event_context"].shape[1] == events.shape[1]
+    call = forecaster.predictor.calls[-1]
+    torch.testing.assert_close(call['context_times'], torch.tensor([0., .05, .10, .15], dtype=torch.float64))
+    torch.testing.assert_close(call['query_times'], torch.tensor([.20, .25, .30, .35], dtype=torch.float64))
+    torch.testing.assert_close(call['event_times'], call['context_times'])
+    assert call["event_context"].shape[1] == events.shape[1]
 
 
 def test_persistence_uses_last_rgb_without_running_predictor_or_event_encoder():
     forecaster = RecordingForecaster()
-    model = ForecastDetector(forecaster, nn.Identity())
+    model = ForecastDetector(forecaster, nn.Identity(), timing=ForecastTiming.from_config({'data': {}}))
     history = torch.randn(4, 4, 3, 2, 2)
     actual = model.features(history, torch.zeros(4, 4, 20, 2, 2), horizon_steps=4, persistence=True)
     torch.testing.assert_close(actual, history[:, -1, :2, 0, 0].unsqueeze(1))

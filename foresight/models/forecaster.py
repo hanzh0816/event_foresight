@@ -17,7 +17,7 @@ class DINOWorldForecaster(nn.Module):
     patch_size = DINOFeatureEncoder.patch_size
 
     def __init__(self, encoder_checkpoint, image_size=(448, 896), history_length=4,
-                 frame_interval_s=0.05, encoder_chunk_size=1, predictor_options=None,
+                 encoder_chunk_size=1, predictor_options=None,
                  event_options=None):
         super().__init__()
         self.encoder = DINOFeatureEncoder(encoder_checkpoint, image_size, encoder_chunk_size)
@@ -37,8 +37,7 @@ class DINOWorldForecaster(nn.Module):
             raise ValueError("predictor.event_enabled must agree with event.enabled")
         options["event_enabled"] = event_enabled
         self.predictor = DINOWorldPredictor(grid_size=self.grid_size, history_length=history_length,
-                                            feature_dim=self.feature_dim, frame_interval_s=frame_interval_s,
-                                            **options)
+                                            feature_dim=self.feature_dim, **options)
         self.event_encoder = None
         if event_enabled:
             from .rvt import RVTEventEncoder
@@ -67,16 +66,19 @@ class DINOWorldForecaster(nn.Module):
             raise ValueError("Event-enabled forecasting requires observed event voxels or event_off=True")
         return self.event_encoder(events)
 
-    def forecast_latents(self, history, events=None, *, event_off=False):
+    def forecast_latents(self, history, events=None, *, context_times, query_times,
+                         observation_times=None, event_times=None, event_off=False):
         encoded = self.encode_latents(history.flatten(0, 1))
         context = encoded.reshape(history.shape[0], self.history_length,
                                   math.prod(self.grid_size), self.feature_dim)
         if self.event_encoder is None:
             if events is not None:
                 raise ValueError("RGB-only forecaster does not accept events")
-            return self.predictor(context)
+            return self.predictor(context, context_times, query_times, observation_times=observation_times)
         event_context = None if event_off else self.encode_events(events)
-        return self.predictor(context, event_context=event_context,
+        return self.predictor(context, context_times, query_times,
+                              observation_times=observation_times, event_context=event_context,
+                              event_times=event_times,
                               event_grid_size=self.event_encoder.output_grid, event_off=event_off)
 
     forecast = forecast_latents

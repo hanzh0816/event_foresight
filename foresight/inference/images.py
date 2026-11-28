@@ -49,8 +49,11 @@ def infer_images(config, image_paths, *, events_path=None, output):
     events = None
     if events_path is not None:
         raw = np.load(events_path, allow_pickle=False)
-        if raw.ndim != 4 or raw.shape[0] != len(images) or not np.isfinite(raw).all() or (raw < 0).any():
-            raise ValueError("Events must be finite, nonnegative [T,2*bins,H,W] log-count features")
+        event_options = config["model"].get("event", {})
+        expected = (len(images), event_options.get("in_channels", 2 * config["data"].get("event_bins", 10)),
+                    *event_options.get("input_size", (512, 1024)))
+        if raw.shape != expected or not np.isfinite(raw).all() or (raw < 0).any():
+            raise ValueError(f"Events must be finite, nonnegative log-count features with shape {expected}")
         events = torch.from_numpy(raw).float()[None].to(device)
     with torch.inference_mode(), inference_context(config):
         prediction = pipeline.predict(history, events, horizon_steps=horizon_steps)[0]
@@ -60,8 +63,13 @@ def infer_images(config, image_paths, *, events_path=None, output):
                                  prediction["scores"].float().cpu().tolist()):
         if score >= score_threshold:
             detections.append(dict(box_xyxy=box, label=label, class_name=CLASSES[label], score=score))
-    result = dict(history_images=list(map(str, paths)), prediction_ms=50*horizon_steps,
-                  assumed_history_interval_ms=50, original_image_size=[HEIGHT, WIDTH],
+    times = pipeline.timing.forecast_kwargs(horizon_steps)
+    result = dict(history_images=list(map(str, paths)),
+                  prediction_ms=1000 * horizon_steps * pipeline.timing.frame_interval_s,
+                  context_times_s=times["context_times"].tolist(),
+                  query_times_s=times["query_times"].tolist(),
+                  event_times_s=times["event_times"].tolist() if events is not None else None,
+                  original_image_size=[HEIGHT, WIDTH],
                   model_image_size=config["data"]["image_size"],
                   coordinate_format="xyxy in original image pixels", detections=detections)
     output.parent.mkdir(parents=True, exist_ok=True)

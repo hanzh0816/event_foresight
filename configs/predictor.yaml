@@ -20,6 +20,14 @@ data:
   persistent_workers: true
   prefetch_factor: 1
 
+# Seconds, prepared once by the caller and passed explicitly to the predictor.
+# null uses regular data.frame_interval_s spacing; Event endpoints match RGB.
+# This config changes positional times, not DSEC's frame/target sampling.
+timing:
+  context_times_s: null
+  event_times_s: null
+  forecast_interval_s: null
+
 model:
   encoder_checkpoint: $Work/models/dino_world/dinov2_vitb14_reg4_pretrain.pth
   predictor_checkpoint: null

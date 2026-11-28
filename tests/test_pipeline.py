@@ -10,6 +10,7 @@ from torch import nn
 from foresight.inference import pipeline
 from foresight.models.checkpoints import TRAINING_FORMAT, input_spec
 from foresight.models.detection.detector import FutureDetector
+from foresight.timing import ForecastTiming
 
 
 class TinyForecaster(nn.Module):
@@ -19,7 +20,7 @@ class TinyForecaster(nn.Module):
     grid_size = (2, 3)
     feature_space = "tiny-last-layer"
     architecture = {"model": "tiny-world-v31", "history_length": 4,
-                    "frame_interval_s": 0.05, "feature_space": feature_space,
+                    "feature_space": feature_space,
                     "feature_dim": feature_dim, "image_size": list(image_size),
                     "predictor": {"depth": 2, "event_enabled": False}}
 
@@ -52,7 +53,8 @@ def trained_detector(tmp_path, monkeypatch):
                              predictor_checkpoint=str(tmp_path / "predictor.ckpt")),
                   data=dict(image_size=[28, 42], context_frames=4),
                   runtime=dict(encoder_chunk_size=1))
-    source = pipeline.ForecastDetector(TinyForecaster(), FutureDetector(**architecture))
+    source = pipeline.ForecastDetector(TinyForecaster(), FutureDetector(**architecture),
+                                       timing=ForecastTiming.from_config(config))
     payload = dict(foresight_format=TRAINING_FORMAT, stage="detector",
                    detector_architecture=architecture,
                    encoder_architecture={"model": "tiny-encoder"},
@@ -160,7 +162,7 @@ def test_predictor_rejects_semantic_or_encoder_dtype_mismatch(trained_detector, 
     case = trained_detector
     payload = case.predictor_payload
     if change == "architecture":
-        payload["forecaster_architecture"]["frame_interval_s"] = 0.1
+        payload["forecaster_architecture"]["predictor"]["depth"] = 3
     else:
         payload["state_dict"]["forecaster.encoder.weight"] = payload["state_dict"]["forecaster.encoder.weight"].double()
     torch.save(payload, case.config["model"]["predictor_checkpoint"])

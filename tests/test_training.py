@@ -13,6 +13,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from foresight.training import CHECKPOINT_FORMAT, DetectorTask, PredictorTask
 from foresight.data.samplers import ValidationSampler
 from foresight.training.runner import make_trainer, resume_config, ValidateAtStepBudget
+from foresight.timing import ForecastTiming
 
 
 class TinyPredictor(nn.Module):
@@ -22,11 +23,11 @@ class TinyPredictor(nn.Module):
         self.dropout = nn.Dropout(0.5)
         self.activation_checkpointing = False
 
-    def predict_sequence(self, history):
+    def predict_sequence(self, history, context_times, query_times, *, event_times=None):
         return self.proj(self.dropout(history))
 
-    def forward(self, history):
-        return self.predict_sequence(history)[:, -1]
+    def forward(self, history, context_times, query_times, *, event_times=None):
+        return self.predict_sequence(history, context_times, query_times, event_times=event_times)[:, -1]
 
 
 class TinyForecaster(nn.Module):
@@ -35,7 +36,7 @@ class TinyForecaster(nn.Module):
     grid_size = (1, 1)
     history_length = 4
     feature_space = "tiny-last-layer"
-    architecture = {"name": "tiny-world", "history_length": 4, "frame_interval_s": 0.05}
+    architecture = {"name": "tiny-world", "history_length": 4}
 
     def __init__(self):
         super().__init__()
@@ -47,10 +48,10 @@ class TinyForecaster(nn.Module):
         self.seen.append(rgb.detach().clone())
         return self.encoder(rgb.mean((-1, -2)))[:, None]
 
-    def forecast(self, history):
+    def forecast(self, history, *, context_times, query_times, event_times=None):
         b, t = history.shape[:2]
         encoded = self.encode_latents(history.flatten(0, 1)).reshape(b, t, 1, 2)
-        return self.predictor(encoded)
+        return self.predictor(encoded, context_times, query_times, event_times=event_times)
 
 
 class TinyEncoder(nn.Module):
@@ -295,7 +296,8 @@ def test_teacher_forcing_supervises_every_shifted_frame(tmp_path):
         future = task.forecaster.encode_latents(batch["future_rgb_target"])
         target = torch.cat((history[:, 1:], future[:, None]), dim=1)
         expected = torch.nn.functional.smooth_l1_loss(
-            task.forecaster.predictor.predict_sequence(history), target, beta=1.0)
+            task.forecaster.predictor.predict_sequence(
+                history, **ForecastTiming.from_config(task.config).sequence_kwargs()), target, beta=1.0)
     actual = task.feature_loss(batch)
     torch.testing.assert_close(actual, expected)
     assert task(batch["history_rgb"]).shape == (2, 4, 1, 2)

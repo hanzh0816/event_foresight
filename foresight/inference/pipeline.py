@@ -8,12 +8,14 @@ from torch import nn
 from ..models.checkpoints import load_predictor, load_shared_detector
 from ..models.forecaster import DINOWorldForecaster
 from ..models.detection import postprocess
+from ..timing import ForecastTiming
 
 
 class ForecastDetector(nn.Module):
-    def __init__(self, forecaster, detector):
+    def __init__(self, forecaster, detector, *, timing):
         super().__init__()
         self.forecaster, self.detector = forecaster, detector
+        self.timing = timing
 
     def features(self, history_rgb, history_events=None, *, horizon_steps=1, event_off=False, persistence=False):
         b, t = history_rgb.shape[:2]
@@ -21,17 +23,17 @@ class ForecastDetector(nn.Module):
             b, t, -1, self.forecaster.feature_dim)
         if persistence:
             return history[:, -1]
-        kwargs = {}
+        kwargs = self.timing.forecast_kwargs(horizon_steps)
         if getattr(self.forecaster, "event_encoder", None) is not None:
             if history_events is None and not event_off:
                 raise ValueError("Event-RGB inference requires history_events")
-            kwargs = dict(event_context=None if event_off else self.forecaster.encode_events(history_events),
+            kwargs = dict(kwargs, event_context=None if event_off else self.forecaster.encode_events(history_events),
                           event_grid_size=self.forecaster.event_encoder.output_grid, event_off=event_off)
         elif history_events is not None:
             raise ValueError("RGB baseline cannot consume events")
         if horizon_steps == 1:
             return self.forecaster.predictor(history, **kwargs)
-        return self.forecaster.predictor.rollout(history, horizon_steps, **kwargs)[:, -1]
+        return self.forecaster.predictor.rollout(history, **kwargs)[:, -1]
 
     def forward(self, history_rgb, history_events=None, **kwargs):
         return self.detector(self.features(history_rgb, history_events, **kwargs))
@@ -43,6 +45,7 @@ class ForecastDetector(nn.Module):
 def load_pipeline(config, checkpoint=None, *, persistence=False):
     """A shared-head checkpoint never supplies random predictor weights for inference."""
     model, data = config["model"], config["data"]
+    timing = ForecastTiming.from_config(config)
     checkpoint = checkpoint or model.get("detector_checkpoint")
     if not checkpoint:
         raise ValueError("Inference requires a trained shared Detector checkpoint")
@@ -50,13 +53,13 @@ def load_pipeline(config, checkpoint=None, *, persistence=False):
         raise ValueError("Forecasting requires a trained model.predictor_checkpoint")
     forecaster = DINOWorldForecaster(
         model["encoder_checkpoint"], image_size=data["image_size"],
-        history_length=data.get("context_frames", 4), frame_interval_s=data.get("frame_interval_s", 0.05),
+        history_length=data.get("context_frames", 4),
         encoder_chunk_size=config["runtime"]["encoder_chunk_size"],
         predictor_options=model.get("predictor", {}), event_options=model.get("event", {}))
     detector = load_shared_detector(checkpoint, forecaster)
     if not persistence:
         load_predictor(forecaster.predictor, model["predictor_checkpoint"], forecaster=forecaster)
-    return ForecastDetector(forecaster, detector).eval().requires_grad_(False)
+    return ForecastDetector(forecaster, detector, timing=timing).eval().requires_grad_(False)
 
 
 def setup_cuda(config):

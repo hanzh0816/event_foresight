@@ -16,6 +16,7 @@ from foresight.models.checkpoints import TRAINING_FORMAT, load_predictor, load_r
 from foresight.training.losses import event_alignment_loss
 from foresight.models.predictor import DINOWorldPredictor
 from foresight.training import PredictorTask
+from foresight.timing import ForecastTiming
 
 
 @pytest.fixture(autouse=True)
@@ -221,8 +222,9 @@ def test_rgb_transfer_preserves_predictions_and_only_adds_zero_gated_event_modul
         torch.testing.assert_close(value, original_event_weights[name], rtol=0, atol=0)
     history = torch.randn(2, 3, 2, 8)
     events = torch.randn(2, 3, 2, 8)
-    torch.testing.assert_close(event.predictor.predict_sequence(history, event_context=events),
-                               rgb.predictor.predict_sequence(history), rtol=0, atol=0)
+    timing = ForecastTiming.from_config(recipe(tmp_path)).sequence_kwargs()
+    torch.testing.assert_close(event.predictor.predict_sequence(history, event_context=events, **timing),
+                               rgb.predictor.predict_sequence(history, **timing), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('corruption', ['shared_weight', 'encoder', 'architecture'])

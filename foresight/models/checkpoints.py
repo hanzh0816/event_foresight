@@ -1,6 +1,7 @@
 """Read complete DINO World checkpoints and verify their feature protocol."""
 
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -25,8 +26,6 @@ def input_spec(config, model):
         raise ValueError("Dataset image_size differs from the loaded DINO World model")
     if hasattr(model, "history_length") and data.get("context_frames", 4) != model.history_length:
         raise ValueError("Dataset context_frames differs from the DINO World model")
-    if data.get("frame_interval_s", 0.05) != 0.05:
-        raise ValueError("DSEC uses a fixed 50 ms frame interval")
     spec = {
         "image_size": list(data["image_size"]),
         "context_frames": data.get("context_frames", 4),
@@ -34,6 +33,7 @@ def input_spec(config, model):
         "tolerance_us": data.get("tolerance_us", 1000),
         "prediction_ms": 50,
         "frame_interval_s": data.get("frame_interval_s", 0.05),
+        "timing": deepcopy(config.get("timing", {})),
         "preprocessing": "pil-bilinear-imagenet-mean-std",
         "feature_space": model.feature_space,
     }
@@ -49,7 +49,7 @@ def input_spec(config, model):
 
 def validate_forecaster(saved, forecaster):
     if saved.get("forecaster_architecture") != forecaster.architecture:
-        raise ValueError("Checkpoint DINO World architecture or temporal protocol differs")
+        raise ValueError("Checkpoint DINO World architecture differs")
 
 
 def component_state(saved, prefix):

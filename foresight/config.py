@@ -70,7 +70,7 @@ def load_config(filename, _seen=None):
             return result
         config = merge(base, config)
     config = deepcopy(config)
-    for section in ("data", "model", "optimization", "runtime", "evaluation", "inference", "resume_overrides"):
+    for section in ("data", "timing", "model", "optimization", "runtime", "evaluation", "inference", "resume_overrides"):
         if section not in config:
             config[section] = {}
         if not isinstance(config[section], dict):
@@ -80,6 +80,16 @@ def load_config(filename, _seen=None):
                            context_frames=4, tolerance_us=1000,
                            frame_interval_s=0.05, batch_size=1, num_workers=4).items():
         data.setdefault(key, value)
+    timing = config["timing"]
+    if timing.keys() - {"context_times_s", "event_times_s", "forecast_interval_s"}:
+        raise ValueError("timing only supports context_times_s, event_times_s and forecast_interval_s")
+    for key in ("context_times_s", "event_times_s", "forecast_interval_s"):
+        timing.setdefault(key, None)
+    for key in ("context_times_s", "event_times_s"):
+        if timing[key] is not None and not isinstance(timing[key], (list, tuple)):
+            raise ValueError(f"timing.{key} must be a list or null")
+    if timing["forecast_interval_s"] is not None and type(timing["forecast_interval_s"]) not in (int, float):
+        raise ValueError("timing.forecast_interval_s must be a number or null")
     for key, value in dict(seed=42, precision="bf16-mixed", encoder_chunk_size=1,
                            cpu_threads=4, log_every=10,
                            limit_train_batches=1.0, limit_val_batches=1.0).items():

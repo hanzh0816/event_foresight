@@ -9,6 +9,7 @@ from torch.nn import functional as F
 
 from .base import _ForecastTask, _detection_report, _distributed
 from .monitoring import log_training_losses
+from ..timing import ForecastTiming
 
 
 class PredictorTask(_ForecastTask):
@@ -18,6 +19,7 @@ class PredictorTask(_ForecastTask):
 
     def __init__(self, config, *, forecaster=None):
         super().__init__(config, forecaster=forecaster)
+        self.timing = ForecastTiming.from_config(config)
         self.forecaster.requires_grad_(False)
         self.forecaster.predictor.requires_grad_(True)
         if getattr(self.forecaster, "event_encoder", None) is not None:
@@ -78,12 +80,13 @@ class PredictorTask(_ForecastTask):
         if getattr(self.forecaster, "event_encoder", None) is None:
             if events is not None:
                 raise ValueError("RGB baseline cannot consume events")
-            return self.forecaster.predictor.predict_sequence(history), None
+            return self.forecaster.predictor.predict_sequence(history, **self.timing.sequence_kwargs()), None
         if events is None:
             raise ValueError("Event-RGB prediction requires history_events")
         encoded = self.forecaster.encode_events(events)
         predicted = self.forecaster.predictor.predict_sequence(
-            history, event_context=encoded, event_grid_size=self.forecaster.event_encoder.output_grid)
+            history, **self.timing.sequence_kwargs(), event_context=encoded,
+            event_grid_size=self.forecaster.event_encoder.output_grid)
         return predicted, encoded
 
     def forward(self, history_rgb, history_events=None):

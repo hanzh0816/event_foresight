@@ -7,30 +7,33 @@ from torch import nn
 from torch.nn import functional as F
 
 
-def apply_rope_3d(tokens, coordinates):
-    """Rotate 64 channels as time=16, y=24, x=24; coordinates are [N,t/y/x].
+def rope_3d_tables(coordinates):
+    """Build FP32 cos/sin tables once for all layers using [N,t/y/x] positions.
 
     Time is measured in seconds, space in RGB patch coordinates. Each axis uses
     angular periods logarithmically spaced from 1e-2 to 1e2. Trigonometry is FP32.
     Spatial attention supplies zero time coordinates, leaving its first 16
     channels unchanged while rotating the same 24+24 spatial channels.
     """
-    if tokens.ndim != 4 or tokens.shape[-1] != 64:
-        raise ValueError("3D RoPE requires [B,heads,N,64]")
-    if tuple(coordinates.shape) != (tokens.shape[-2], 3):
-        raise ValueError("RoPE coordinates must have shape [N,3]")
-    pieces, start = [], 0
-    with torch.autocast(device_type=tokens.device.type, enabled=False):
+    angles = []
+    with torch.autocast(device_type=coordinates.device.type, enabled=False):
         for axis, width in enumerate((16, 24, 24)):
-            periods = torch.logspace(-2, 2, width // 2, device=tokens.device, dtype=torch.float32)
-            angles = coordinates[:, axis].float()[:, None] * (2 * math.pi / periods)
-            cosine, sine = angles.cos()[None, None], angles.sin()[None, None]
-            pairs = tokens[..., start:start + width].float().reshape(*tokens.shape[:-1], width // 2, 2)
-            real, imaginary = pairs.unbind(-1)
-            pieces.append(torch.stack((real * cosine - imaginary * sine,
-                                       real * sine + imaginary * cosine), dim=-1).flatten(-2))
-            start += width
-    return torch.cat(pieces, dim=-1).to(tokens.dtype)
+            periods = torch.logspace(-2, 2, width // 2, device=coordinates.device, dtype=torch.float32)
+            angles.append(coordinates[:, axis].float()[:, None] * (2 * math.pi / periods))
+        angles = torch.cat(angles, dim=-1)
+        return angles.cos(), angles.sin()
+
+
+def apply_rope_3d(tokens, tables):
+    """Rotate Q/K with shared tables; feature rotations remain layer-specific."""
+    cosine, sine = tables
+    with torch.autocast(device_type=tokens.device.type, enabled=False):
+        real, imaginary = tokens.float().reshape(*tokens.shape[:-1], 32, 2).unbind(-1)
+        cosine = cosine.reshape(1, 1, tokens.shape[-2], 32)
+        sine = sine.reshape(1, 1, tokens.shape[-2], 32)
+        result = torch.stack((real * cosine - imaginary * sine,
+                              real * sine + imaginary * cosine), dim=-1).flatten(-2)
+    return result.to(tokens.dtype)
 
 
 class DropPath(nn.Module):
@@ -56,27 +59,30 @@ class CausalCrossAttention(nn.Module):
         self.q, self.kv = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, query, context, query_coordinates, context_coordinates,
-                observation_times, context_times, chunk_size):
+    def forward(self, query, context, query_rope, context_rope, prefixes, chunk_size):
+        """Attend to CPU-planned (query start, query end, visible KV count) runs."""
         batch, count, dim = query.shape
         q = self.q(self.query_norm(query)).reshape(batch, count, self.heads, 64).transpose(1, 2)
         k, v = self.kv(self.context_norm(context)).reshape(batch, -1, 2, self.heads, 64).unbind(2)
-        q = apply_rope_3d(q, query_coordinates)
-        k = apply_rope_3d(k.transpose(1, 2), context_coordinates)
+        q = apply_rope_3d(q, query_rope)
+        k = apply_rope_3d(k.transpose(1, 2), context_rope)
+        v = v.transpose(1, 2)
         pieces = []
-        for start in range(0, count, chunk_size or count):
-            end = min(start + (chunk_size or count), count)
-            # Availability is bounded by the input cutoff, never by the future
-            # query timestamp. This also handles event endpoints between RGBs.
-            allowed = context_times[None] <= observation_times[start:end, None]
-            value = F.scaled_dot_product_attention(
-                q[:, :, start:end], k, v.transpose(1, 2), attn_mask=allowed,
-                dropout_p=self.dropout if self.training else 0.0)
-            value = self.proj(value.transpose(1, 2).reshape(batch, end - start, dim))
-            # If no event has arrived at a query's cutoff, the branch contributes
-            # zero including the output projection bias.
-            value = value * allowed.any(-1)[None, :, None]
-            pieces.append(value)
+        for group_start, group_end, visible in prefixes:
+            for start in range(group_start, group_end, chunk_size or count):
+                end = min(start + (chunk_size or count), group_end)
+                if visible:
+                    value = F.scaled_dot_product_attention(
+                        q[:, :, start:end], k[:, :, :visible], v[:, :, :visible],
+                        dropout_p=self.dropout if self.training else 0.0)
+                    value = self.proj(value.transpose(1, 2).reshape(batch, end - start, dim))
+                else:
+                    # An empty Event prefix contributes zero, including proj.bias.
+                    # Empty sums keep K/V and their normalization in autograd so
+                    # DDP still receives zero gradients for an unavailable branch.
+                    value = q[:, :, start:end].transpose(1, 2).reshape(batch, end - start, dim) * 0
+                    value = self.proj(value + k[:, :, :0].sum() + v[:, :, :0].sum()) * 0
+                pieces.append(value)
         return F.dropout(torch.cat(pieces, dim=1), p=self.dropout, training=self.training)
 
 
@@ -89,14 +95,14 @@ class SpatialSelfAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.qkv, self.proj = nn.Linear(dim, 3 * dim), nn.Linear(dim, dim)
 
-    def forward(self, query, spatial_coordinates, chunk_size):
+    def forward(self, query, spatial_rope, chunk_size):
         batch, count, dim = query.shape
-        spatial = len(spatial_coordinates)
+        spatial = len(spatial_rope[0])
         frames = count // spatial
         value = self.norm(query).reshape(batch * frames, spatial, dim)
         q, k, v = self.qkv(value).reshape(batch * frames, spatial, 3, self.heads, 64).unbind(2)
-        q = apply_rope_3d(q.transpose(1, 2), spatial_coordinates)
-        k = apply_rope_3d(k.transpose(1, 2), spatial_coordinates)
+        q = apply_rope_3d(q.transpose(1, 2), spatial_rope)
+        k = apply_rope_3d(k.transpose(1, 2), spatial_rope)
         pieces = []
         for start in range(0, spatial, chunk_size or spatial):
             end = min(start + (chunk_size or spatial), spatial)
@@ -123,15 +129,13 @@ class CrossAttentionBlock(nn.Module):
                                  nn.Dropout(dropout))
         self.drop_path = DropPath(drop_path)
 
-    def forward(self, query, context, query_coordinates, context_coordinates,
-                observation_times, context_times, spatial_coordinates, chunk_size,
-                event_context=None, event_coordinates=None, event_times=None):
+    def forward(self, query, context, query_rope, context_rope, rgb_prefixes,
+                spatial_rope, chunk_size, event_context=None, event_rope=None,
+                event_prefixes=None):
         query = query + self.drop_path(self.rgb_attention(
-            query, context, query_coordinates, context_coordinates,
-            observation_times, context_times, chunk_size))
+            query, context, query_rope, context_rope, rgb_prefixes, chunk_size))
         if self.event_attention is not None and event_context is not None:
             query = query + self.drop_path(self.gamma.tanh() * self.event_attention(
-                query, event_context, query_coordinates, event_coordinates,
-                observation_times, event_times, chunk_size))
-        query = query + self.drop_path(self.spatial_attention(query, spatial_coordinates, chunk_size))
+                query, event_context, query_rope, event_rope, event_prefixes, chunk_size))
+        query = query + self.drop_path(self.spatial_attention(query, spatial_rope, chunk_size))
         return query + self.drop_path(self.mlp(self.norm(query)))
